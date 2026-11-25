@@ -92,6 +92,8 @@ def main():
     p.add_argument('--height', type=int, default=720)
     p.add_argument('--frames', type=int, nargs='+', default=list(range(91)))
     p.add_argument('--spp', type=int, nargs='+', default=[1, 2, 4])
+    p.add_argument('--spacing', type=int, nargs='+', default=[4],
+                   help='interpolation grid spacings to compare; preserves variant names for the default')
     p.add_argument('--reference-spp', type=int, default=128)
     p.add_argument('--seed', type=int, default=0x63d83595)
     p.add_argument('--reference-seed', type=int, default=20261126)
@@ -101,6 +103,8 @@ def main():
         p.error('CUDA requires an explicitly approved existing allocation')
     if not 0 <= a.warmup < len(a.frames) or min(a.frames) < 0 or min(a.spp) < 1 or a.reference_spp <= max(a.spp):
         p.error('Invalid frames, warmup, or sample budgets')
+    if any(not 1 <= spacing <= 64 for spacing in a.spacing):
+        p.error('interpolation spacing must be in [1, 64]')
     a.output.mkdir(parents=True)
     ref = a.output / 'reference'
     run(a.baseline, 'scan', 0, a.reference_spp, a, ref)
@@ -109,6 +113,9 @@ def main():
                 ('analytic', a.analytic, 'scan', 0), ('refit-interpolate', a.baseline, 'refit', 4),
                 ('refit-analytic', a.analytic, 'refit', 0), ('interpolate-analytic', a.analytic, 'scan', 4),
                 ('combined', a.analytic, 'refit', 4)]
+    variants = [(name if a.spacing == [4] or not spacing else f'{name}-grid{grid}', binary, mode, grid)
+                for name, binary, mode, spacing in variants
+                for grid in (sorted(set(a.spacing)) if spacing else [0])]
     with (a.output / 'summary.csv').open('w', newline='') as f:
         out = csv.writer(f)
         out.writerow(['variant', 'spp', 'frames', 'compute_p50_ms', 'compute_p95_ms',
