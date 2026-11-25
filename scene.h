@@ -553,7 +553,7 @@ ACG_HD inline float visibility(Ray r,float limit,const Balls &balls,int stage) {
 }
 constexpr int area_samples=2;
 ACG_HD inline Vec direct_sample(Vec p,Vec n,Vec wo,Vec source,Vec intensity,bool area,
-                                Material m,const Balls &balls,int stage,float cached=-1) {
+                                Material m,const Balls &balls,int stage,float cached=-1,bool compete=true) {
     Vec delta=source-p; float d2=dot(delta,delta),dist=sqrtf(d2); Vec wi=delta*(1/dist);
     float c=dot(n,wi); if(c<=0 || (area && wi.y<=0)) return grey(0);
     // Aim from the offset origin to the actual sample (including near grazing).
@@ -562,14 +562,14 @@ ACG_HD inline Vec direct_sample(Vec p,Vec n,Vec wo,Vec source,Vec intensity,bool
     float pdf; Vec f=brdf(m,n,wo,wi,pdf);
     if(!area) return f*intensity*(vis*c/d2); // radiant intensity, inverse square
     float lp=d2/(wi.y*light_area);
-    return f*intensity*(vis*c*power_weight(area_samples*lp,pdf)/(lp*area_samples));
+    return f*intensity*(vis*c*(compete?power_weight(area_samples*lp,pdf):1.f)/(lp*area_samples));
 }
 #ifdef __CUDACC__
 ACG_HD __noinline__
 #else
 inline
 #endif
-bool analytic_area_sample(Vec p,Vec n,Vec wo,Vec q,Material m,const Balls& balls,Vec& result) {
+bool analytic_area_sample(Vec p,Vec n,Vec wo,Vec q,Material m,const Balls& balls,Vec& result,bool compete) {
     SoftSlice slice;
     if(!soft_slice(p,balls.c,q.z,slice,soft_lamp,radius,eps)) return false;
     Vec c=m.diffuse*(1/pi);
@@ -578,12 +578,12 @@ bool analytic_area_sample(Vec p,Vec n,Vec wo,Vec q,Material m,const Balls& balls
         Vec d=q-p; float d2=dot(d,d); Vec wi=d*(1/sqrtf(d2));
         float pdf; Vec f=brdf(m,n,wo,wi,pdf);
         float lp=d2/(wi.y*light_area);
-        sum=sum+(f*power_weight(area_samples*lp,pdf)-c)*(2*light_hx*wi.y*wi.y/d2);
+        sum=sum+(f*(compete?power_weight(area_samples*lp,pdf):1.f)-c)*(2*light_hx*wi.y*wi.y/d2);
     }
     result=emission()*sum*(2*light_hz/area_samples);
     return true;
 }
-ACG_HD inline Vec lighting(Vec p,Vec n,Vec wo,Material m,const Balls &balls,int stage,Rng &rng,const Hit& hit,bool analytic,float cached) {
+ACG_HD inline Vec lighting(Vec p,Vec n,Vec wo,Material m,const Balls &balls,int stage,Rng &rng,const Hit& hit,bool analytic,float cached,bool compete) {
     Vec I=stage==2?Vec{1.8f,1.63f,1.52f}:Vec{8.05f,7.35f,6.37f};
     Vec out=direct_sample(p,n,wo,{-.73f,1.54f,-.46f},I,false,m,balls,stage,cached);
     if(stage==2 && p.y<light_y) {
@@ -601,11 +601,11 @@ ACG_HD inline Vec lighting(Vec p,Vec n,Vec wo,Material m,const Balls &balls,int 
 #endif
             Vec q={(2*(eligible?u*area_samples-i:u)-1)*light_hx,light_y,light_z+(2*v-1)*light_hz};
             Vec contribution;
-            if(eligible && analytic_area_sample(p,n,wo,q,m,balls,contribution)) {
+            if(eligible && analytic_area_sample(p,n,wo,q,m,balls,contribution,compete)) {
                 out=out+contribution;
                 continue;
             }
-            out=out+direct_sample(p,n,wo,q,emission(),true,m,balls,stage);
+            out=out+direct_sample(p,n,wo,q,emission(),true,m,balls,stage,-1.f,compete);
         }
     }
     return out;
@@ -621,7 +621,8 @@ ACG_HD inline bool glass_bounce(Vec d,Vec n,bool entering,Rng &rng,Vec &dir,floa
 }
 ACG_HD inline Vec trace(Ray ray,const Balls &balls,int stage,float t,Rng &rng,bool analytic=false,float cached=-1) {
     Vec out={},beta=grey(1),prev={}; float prev_pdf=0,eta_scale=1; bool delta=true,inside=false;
-    for(int depth=0;depth<14;++depth) {
+    constexpr int max_hits=14;
+    for(int depth=0;depth<max_hits;++depth) {
         Hit hit; float t0=eps;
         for(;;) {
             if(!intersect(ray,balls,stage,t0,far_t,hit)) return out;
@@ -654,8 +655,9 @@ ACG_HD inline Vec trace(Ray ray,const Balls &balls,int stage,float t,Rng &rng,bo
         } else {
             Material m=material(hit,p,balls,t,stage);
             const float vis=depth==0 && hit.mat==Felt && n.y==1 && fabsf(p.y)<eps?cached:-1.f;
-            out=out+beta*lighting(p,n,wo,m,balls,stage,rng,hit,analytic,vis);
-            if(stage==0) break;
+            const bool continue_path=stage!=0 && depth+1<max_hits;
+            out=out+beta*lighting(p,n,wo,m,balls,stage,rng,hit,analytic,vis,continue_path);
+            if(!continue_path) break;
             wi=sample_direction(m,n,wo,rng); float c=dot(wi,n);
             if(c<=0) break;
             Vec f=brdf(m,n,wo,wi,prev_pdf); if(prev_pdf<=0) break;
