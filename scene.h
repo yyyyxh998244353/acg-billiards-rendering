@@ -621,7 +621,11 @@ ACG_HD inline bool glass_bounce(Vec d,Vec n,bool entering,Rng &rng,Vec &dir,floa
 }
 ACG_HD inline Vec trace(Ray ray,const Balls &balls,int stage,float t,Rng &rng,bool analytic=false,float cached=-1) {
     Vec out={},beta=grey(1),prev={}; float prev_pdf=0,eta_scale=1; bool delta=true,inside=false;
-    constexpr int max_hits=14;
+#ifndef ACG_MAX_HITS
+#define ACG_MAX_HITS 14
+#endif
+    constexpr int max_hits=ACG_MAX_HITS;
+    static_assert(max_hits>=1 && max_hits<=14,"Invalid preview path depth");
     for(int depth=0;depth<max_hits;++depth) {
         Hit hit; float t0=eps;
         for(;;) {
