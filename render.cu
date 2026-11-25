@@ -121,6 +121,8 @@ int main(int argc, char** argv) try {
     const int spp = integer(argv[4], 1, imax, "spp");
     const float time = scene_time(argv[6]);
     const bool sequence_mode=argc==8 && std::strcmp(argv[5],"--sequence")==0;
+    const char* timing=std::getenv("ACG_TIMING_ONLY");
+    const bool timing_only=timing && std::strcmp(timing,"1")==0;
     const auto frames=sequence_mode?sequence::read_manifest(argv[7]):std::vector<sequence::Frame>{};
     float balls[64 * 32];
     const unsigned poses=sequence_mode?1:argc-7;
@@ -248,13 +250,17 @@ int main(int argc, char** argv) try {
     const double render_ms = elapsed_ms(render_start), d2h_ms = 0.0;
     constexpr const char* backend = "cpu";
 #endif
-    const auto io_start = Clock::now();
-    std::ofstream out(sequence_mode?frames[frame].output_path:std::filesystem::path(argv[5]),std::ios::binary);
-    out << "P6\n" << w << ' ' << h << "\n255\n";
-    out.write(reinterpret_cast<const char*>(image.get()), static_cast<std::streamsize>(bytes));
-    out.close();
-    if (!out) throw std::runtime_error("failed writing output image");
-    const double io_ms = elapsed_ms(io_start), total_ms = elapsed_ms(total_start);
+    double io_ms=0;
+    if(!timing_only) {
+        const auto io_start = Clock::now();
+        std::ofstream out(sequence_mode?frames[frame].output_path:std::filesystem::path(argv[5]),std::ios::binary);
+        out << "P6\n" << w << ' ' << h << "\n255\n";
+        out.write(reinterpret_cast<const char*>(image.get()), static_cast<std::streamsize>(bytes));
+        out.close();
+        if (!out) throw std::runtime_error("failed writing output image");
+        io_ms=elapsed_ms(io_start);
+    }
+    const double total_ms=elapsed_ms(total_start);
     // render_ms = one kernel (sampling + tonemap) on CUDA, render loop on CPU.
     // Frame wall time excludes manifest/snapshot parsing and persistent device setup.
     if(frame==0) std::cout << "backend,stage,width,height,spp,time,base_seed,render_ms,d2h_wall_ms,ppm_wall_ms,total_wall_ms,frame,prepare_ms,cache_ms,upload_ms\n";
