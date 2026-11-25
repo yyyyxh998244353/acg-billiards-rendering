@@ -584,8 +584,17 @@ ACG_HD inline Vec lighting(Vec p,Vec n,Vec wo,Material m,const Balls &balls,int 
     Vec out=direct_sample(p,n,wo,{-.73f,1.54f,-.46f},I,false,m,balls,stage,cached);
     if(stage==2 && p.y<light_y) {
         const bool eligible=analytic && soft_eligible(stage,hit,p,n,balls.c);
+#ifdef ACG_STRATIFY_LIGHT_2D
+        // Randomly pair the X and Z strata; a fixed diagonal would leave half
+        // of the emitter unsampled. The marginal light PDF is unchanged.
+        static_assert(area_samples==2,"two strata per axis");
+        const int flip=int(hash32(rng.s ^ 0x640f32d1u)>>31);
+#endif
         for(int i=0;i<area_samples;++i) {
             float u=(i+rng.next())/area_samples,v=rng.next();
+#ifdef ACG_STRATIFY_LIGHT_2D
+            if(!eligible) v=((i^flip)+v)*.5f;
+#endif
             Vec q={(2*(eligible?u*area_samples-i:u)-1)*light_hx,light_y,light_z+(2*v-1)*light_hz};
             Vec contribution;
             if(eligible && analytic_area_sample(p,n,wo,q,m,balls,contribution)) {
