@@ -24,11 +24,9 @@
 #endif
 #include "scene.h"
 using acg_scene_detail::BallBVH;
+using acg_scene_detail::Balls;
 #include "sequence.h"
 #include "interpolate.h"
-#ifdef __CUDACC__
-__constant__ float device_balls[64 * 32];
-#endif
 
 namespace {
 using Clock = std::chrono::steady_clock;
@@ -57,7 +55,7 @@ RENDER_HD inline unsigned char display_byte(float linear) {
     return static_cast<unsigned char>(255.0f * s + 0.5f);
 }
 
-RENDER_HD inline RGB8 render_pixel(int x, int y, int w, int h, int stage, int spp, float time, const float* balls, unsigned poses, const BallBVH* trees,float cached=-1) {
+RENDER_HD inline RGB8 render_pixel(int x, int y, int w, int h, int stage, int spp, const Balls* balls, unsigned poses,float cached=-1) {
     // No dependency on launch order, stage, spp budget or time. Matching pixels
     // share the same prefix of random samples in all comparison renders.
     const u32 pixel_key = mix_bits(base_seed ^ static_cast<u32>(y)) ^ static_cast<u32>(x);
@@ -66,7 +64,10 @@ RENDER_HD inline RGB8 render_pixel(int x, int y, int w, int h, int stage, int sp
     for (int s = 0; s < spp; ++s) {
         const u32 seed = mix_bits(first + static_cast<u32>(s));
         const unsigned pose = (static_cast<std::uint64_t>(mix_bits(seed ^ 0xba7c19u)) * poses) >> 32;
-        const Vec v = sample_pixel(x, y, w, h, stage, seed ? seed : base_seed, time, balls + 32 * pose, trees?trees+pose:nullptr,analytic_shadow,cached);
+        using namespace acg_scene_detail;
+        Rng rng={hash32((seed?seed:base_seed)^hash32(u32(x)+0x9e3779b9u)^hash32(u32(y)+0x243f6a88u))};
+        const Ray ray=camera(x,y,w,h,stage,rng);
+        const Vec v=trace(ray,balls[pose],stage,0.f,rng,analytic_shadow,cached);
         r += v.x; g += v.y; b += v.z;
     }
     const float inv = 1.0f / spp;
@@ -74,10 +75,10 @@ RENDER_HD inline RGB8 render_pixel(int x, int y, int w, int h, int stage, int sp
 }
 
 #ifdef __CUDACC__
-__global__ void render_pixels(RGB8* pixels, size_t count, int w, int h, int stage, int spp, float time, unsigned poses, const BallBVH* trees,const float* cache) {
+__global__ void render_pixels(RGB8* pixels, size_t count, int w, int h, int stage, int spp, const Balls* device_balls,unsigned poses,const float* cache) {
     const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
     for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < count; i += stride)
-        pixels[i] = render_pixel(static_cast<int>(i % w), static_cast<int>(i / w), w, h, stage, spp, time, device_balls, poses, trees,cache?cache[i]:-1.f);
+        pixels[i] = render_pixel(static_cast<int>(i % w), static_cast<int>(i / w), w, h, stage, spp, device_balls, poses,cache?cache[i]:-1.f);
 }
 
 void check(cudaError_t e, const char* operation) {
@@ -137,6 +138,8 @@ int main(int argc, char** argv) try {
     std::cerr << "CUDA device 0: " << prop.name << " (sm_" << prop.major << prop.minor << ")\n";
     BallBVH* device_trees=nullptr;
     float* device_cache=nullptr;
+    Balls* device_balls=nullptr;
+    CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&device_balls),poses*sizeof(Balls)));
     RGB8* device = nullptr;
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&device), bytes));
     cudaEvent_t begin, end;
@@ -155,14 +158,17 @@ int main(int argc, char** argv) try {
     const bool use_tree=query && (std::strcmp(query,"rebuild")==0 || std::strcmp(query,"refit")==0);
     if(query && !use_tree && std::strcmp(query,"scan")!=0)
         throw std::runtime_error("ACG_BVH must be scan, rebuild or refit");
-    for(unsigned i=0;use_tree && i<poses;++i) {
-        acg_scene_detail::Balls state;
+    Balls prepared[64];
+    for(unsigned i=0;i<poses;++i) {
+        auto& state=prepared[i];
         place_balls(state,time,balls+32*i);
+        if(!use_tree) continue;
         if((i || frame) && std::strcmp(query,"refit")==0) {
             trees[i]=i?trees[i-1]:prior;
             refit_ball_bvh(trees[i],state);
         } else build_ball_bvh(trees[i],state);
         prior=trees[i];
+        state.tree=trees+i;
     }
     const double prepare_ms=elapsed_ms(total_start);
     std::cerr << "balls=" << (query?query:"scan") << " prepare_ms=" << prepare_ms << '\n';
@@ -206,11 +212,12 @@ int main(int argc, char** argv) try {
     const double cache_ms=elapsed_ms(cache_start);
 #ifdef __CUDACC__
     const auto upload_start=Clock::now();
-    CUDA_CHECK(cudaMemcpyToSymbol(device_balls, balls, poses * 32 * sizeof(float)));
     if(use_tree) {
         if(!device_trees) CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&device_trees),poses*sizeof(BallBVH)));
         CUDA_CHECK(cudaMemcpy(device_trees,trees,poses*sizeof(BallBVH),cudaMemcpyHostToDevice));
     }
+    for(unsigned i=0;i<poses;++i) prepared[i].tree=use_tree?device_trees+i:nullptr;
+    CUDA_CHECK(cudaMemcpy(device_balls,prepared,poses*sizeof(Balls),cudaMemcpyHostToDevice));
     if(!cache.empty()) {
         if(!device_cache) CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&device_cache),count*sizeof(float)));
         CUDA_CHECK(cudaMemcpy(device_cache,cache.data(),count*sizeof(float),cudaMemcpyHostToDevice));
@@ -218,7 +225,7 @@ int main(int argc, char** argv) try {
     const double upload_ms=elapsed_ms(upload_start);
     const unsigned blocks = static_cast<unsigned>(std::min<size_t>((count - 1) / threads + 1, 65535));
     CUDA_CHECK(cudaEventRecord(begin));
-    render_pixels<<<blocks, threads>>>(device, count, w, h, stage, spp, time, poses, device_trees, device_cache);
+    render_pixels<<<blocks, threads>>>(device, count, w, h, stage, spp, device_balls, poses, device_cache);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaEventRecord(end));
     CUDA_CHECK(cudaEventSynchronize(end));
@@ -236,7 +243,7 @@ int main(int argc, char** argv) try {
 #endif
     for (int y = 0; y < h; ++y)
         for (int x = 0; x < w; ++x)
-            image[static_cast<size_t>(y) * w + x] = render_pixel(x, y, w, h, stage, spp, time, balls, poses, use_tree?trees:nullptr,
+            image[static_cast<size_t>(y) * w + x] = render_pixel(x, y, w, h, stage, spp, prepared, poses,
                                                                cache.empty()?-1.f:cache[size_t(y)*w+x]);
     const double render_ms = elapsed_ms(render_start), d2h_ms = 0.0;
     constexpr const char* backend = "cpu";
@@ -260,6 +267,7 @@ int main(int argc, char** argv) try {
     CUDA_CHECK(cudaEventDestroy(end));
     CUDA_CHECK(cudaEventDestroy(begin));
     CUDA_CHECK(cudaFree(device));
+    CUDA_CHECK(cudaFree(device_balls));
     if(device_trees) CUDA_CHECK(cudaFree(device_trees));
     if(device_cache) CUDA_CHECK(cudaFree(device_cache));
 #endif
