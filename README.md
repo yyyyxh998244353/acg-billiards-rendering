@@ -15,7 +15,7 @@ Pass additional uniformly spaced snapshots after the first snapshot to sample an
 | Path tracing; diffuse and specular | Stages 1–2 in `scene.h`; stage 0 is diagnostic direct lighting only. |
 | Custom scene | Orthographic overhead view; simplified analytical table, rails, and pockets; analytical spheres use the simulator's centers and radius. |
 | Acceleration structure | Self-written stackless static BVH; balls use analytical intersections, with no tessellation. |
-| Transmissive material | Glass sphere, dielectric reflection/refraction and Fresnel. |
+| Transmissive material | Build with `-DACG_GLASS_REFERENCE` for the separate glass-sphere render; dielectric reflection/refraction and Fresnel. The table render omits this prop. |
 | Original color texture | Ball-local procedural wood, veined marble, glazed ceramic, woven pattern and numbered enamel. |
 | Importance sampling and Russian roulette | BSDF/PDF weighting and path termination in `trace`. |
 | Motion blur and depth of field | Exposure samples from independent physics snapshots; orthographic thin lens (`ACG_PINHOLE` for control). |

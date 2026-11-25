@@ -100,6 +100,8 @@ struct StaticScene {
     }
 };
 constexpr float pocket_x=1.283f,pocket_z=.652f,bore=.069f;
+constexpr float pocket_top=.049f,pocket_throat=.056f,pocket_bevel=.025f;
+constexpr float pocket_slope=(bore-pocket_throat)/pocket_bevel;
 ACG_HD constexpr StaticScene make_room() {
     StaticScene s={};
     s.add({-3.6f,-.85f,-2.65f},{3.6f,-.82f,3.65f},Floor);
@@ -122,11 +124,13 @@ ACG_HD constexpr StaticScene make_room() {
         s.add({qx-.032f,0,-.581f},{qx+.032f,.044f,.581f},Felt,CushionZ,side);
         for(int k=-1;k<=1;++k) {
             float cx=k*pocket_x,cz=side*pocket_z;
-            s.add({cx-bore,-.114f,cz-bore},{cx+bore,.043f,cz+bore},Leather,Well);
+            s.add({cx-bore,-.225f,cz-bore},{cx+bore,pocket_top,cz+bore},Leather,Well);
         }
     }
-    // Crystal award and pierced brass score screen on the far rail (stages 1/2).
+    // Keep the transmissive reference object out of the primary table image.
+#ifdef ACG_GLASS_REFERENCE
     s.add({-.852f,.079f,-.822f},{-.682f,.249f,-.652f},Glass,Globe,2);
+#endif
     s.add({.635f,.118f,-.744f},{.957f,.266f,-.743f},Grille,Screen,2);
     s.build(0,s.size); return s;
 }
@@ -154,7 +158,8 @@ ACG_HD inline Vec resting(int slot,int &row,int &col) {
 ACG_HD inline float ease_out(float t) { float a=1-clamp(t,0,1); return 1-a*a; }
 constexpr float contact_t=1.12f, cue_contact=.31f-2*radius;
 ACG_HD inline Vec cue_at_contact() { return {cue_contact,radius,0}; }
-struct Balls { Vec c[16]; Box box; };
+struct BallBVH;
+struct Balls { Vec c[16]; Box box; const BallBVH* tree=nullptr; };
 ACG_HD inline void place_balls(Balls &balls,float t,const float *positions) {
     if(positions) {
         for(int i=0;i<16;++i) {
@@ -194,6 +199,7 @@ ACG_HD inline bool sphere_t(Ray r,Vec c,float rad,float tmin,float tmax,float &t
     float root=sqrtf(q); t=proj-root; if(t<=tmin) t=proj+root;
     return t>tmin && t<tmax;
 }
+#include "ball_bvh.h"
 ACG_HD inline float pocket_distance2(Vec v) {
     float x=fabsf(v.x); x=x>pocket_x*.5f?x-pocket_x:x;
     float z=fabsf(v.z)-pocket_z; return x*x+z*z;
@@ -240,22 +246,34 @@ ACG_HD inline void primitive(const Prim &p,Ray r,Vec inv,float t0,Hit &h) {
     Span s;
     if(!box_span(b,r,inv,s) || s.b<=t0 || s.a>=h.t) return;
     if(p.shape==Well) {
-        Vec c=(b.a+b.b)*.5f,v=r.o-c;
-        float a=r.d.x*r.d.x+r.d.z*r.d.z,beta=v.x*r.d.x+v.z*r.d.z;
-        float ybottom=(b.a.y-r.o.y)*inv.y;
-        if(ybottom>t0 && ybottom<h.t) {
-            Vec pb=v+r.d*ybottom;
-            if(pb.x*pb.x+pb.z*pb.z<=bore*bore) record(h,ybottom,{0,1,0},Leather);
+        const Vec c=(b.a+b.b)*.5f,v=r.o-c;
+        const float seam=pocket_top-pocket_bevel;
+        const float bottom=(b.a.y-r.o.y)*inv.y;
+        if(bottom>t0 && bottom<h.t) {
+            Vec p=v+r.d*bottom;
+            if(p.x*p.x+p.z*p.z<=pocket_throat*pocket_throat)
+                record(h,bottom,{0,1,0},Leather);
         }
-        if(a<1.e-12f) return;
-        float det=bore*bore*a-(v.x*r.d.z-v.z*r.d.x)*(v.x*r.d.z-v.z*r.d.x);
-        if(det<0) return;
-        float root=sqrtf(det);
-        for(int k=0;k<2;++k) {
-            float t=(-beta+(k?root:-root))/a;
-            if(t<=t0 || t>=h.t) continue;
-            Vec pt=v+r.d*t; float y=pt.y+c.y;
-            if(y>=b.a.y && y<=b.b.y) record(h,t,unit({-pt.x,0,-pt.z}),Leather);
+        // Intersect a vertical throat and a flared entrance, both analytically.
+        for(int part=0;part<2;++part) {
+            float k=part?pocket_slope:0.f;
+            float r0=pocket_throat+k*(r.o.y-seam), rd=k*r.d.y;
+            float a=r.d.x*r.d.x+r.d.z*r.d.z-rd*rd;
+            float beta=v.x*r.d.x+v.z*r.d.z-r0*rd;
+            float cc=v.x*v.x+v.z*v.z-r0*r0;
+            float det=beta*beta-a*cc;
+            if(det<0) continue;
+            const float q=-beta-copysignf(sqrtf(det),beta);
+            const bool linear=fabsf(a)<1.e-9f;
+            for(int j=0;j<2;++j) {
+                if((linear && (j || fabsf(beta)<1.e-9f)) || (j && q==0)) continue;
+                float t=linear?-cc/(2*beta):(j?cc/q:q/a);
+                if(t<=t0 || t>=h.t) continue;
+                Vec p=v+r.d*t; float y=r.o.y+r.d.y*t;
+                if(y>=(part?seam:b.a.y) && y<=(part?pocket_top:seam))
+                    record(h,t,unit({-p.x,k*(pocket_throat+k*(y-seam)),-p.z}),
+                           part?Ebony:Leather);
+            }
         }
         return;
     }
@@ -270,17 +288,24 @@ ACG_HD inline void primitive(const Prim &p,Ray r,Vec inv,float t0,Hit &h) {
     }
     for(int k=0;k<2;++k) {
         float t=k?s.b:s.a; if(t<=t0 || t>=h.t) continue;
-        if(p.shape==BoredBlock && pocket_distance2(r.o+r.d*t)<bore*bore) continue;
+        if(p.shape==BoredBlock || cushion) {
+            const Vec p0=r.o+r.d*t;
+            const float opening=pocket_throat+pocket_slope*clamp(p0.y-(pocket_top-pocket_bevel),0.f,pocket_bevel);
+            if(pocket_distance2(p0)<opening*opening) continue;
+        }
         Vec n=k?s.nb:s.na; record(h,t,cushion?unit(n):n,p.mat); break;
     }
 }
 
-constexpr float light_y=1.37f,light_z=-.24f,light_hx=.79f,light_hz=.215f;
+constexpr float light_y=1.37f,light_z=-1.08f,light_hx=.79f,light_hz=.215f;
 constexpr float light_area=4*light_hx*light_hz;
 ACG_HD constexpr Vec emission() { return {12.0f,10.9f,9.4f}; }
+#include "soft_intervals.h"
 ACG_HD inline bool intersect(Ray r,const Balls &balls,int stage,float t0,float t1,Hit &h) {
     h.t=t1; Vec inv=invdir(r.d);
-    if(overlaps(balls.box,r,inv,t0,h.t)) {
+    if(balls.tree) {
+        intersect_ball_bvh(*balls.tree,balls,r,inv,t0,h);
+    } else if(overlaps(balls.box,r,inv,t0,h.t)) {
         for(int i=0;i<16;++i) {
             float t;
             if(sphere_t(r,balls.c[i],radius,t0,h.t,t)) record(h,t,unit((r.o-balls.c[i])+r.d*t),Ball,i);
@@ -510,24 +535,38 @@ ACG_HD inline float visibility(Ray r,float limit,const Balls &balls,int stage) {
 }
 constexpr int area_samples=2;
 ACG_HD inline Vec direct_sample(Vec p,Vec n,Vec wo,Vec source,Vec intensity,bool area,
-                                Material m,const Balls &balls,int stage) {
+                                Material m,const Balls &balls,int stage,float cached=-1) {
     Vec delta=source-p; float d2=dot(delta,delta),dist=sqrtf(d2); Vec wi=delta*(1/dist);
     float c=dot(n,wi); if(c<=0 || (area && wi.y<=0)) return grey(0);
     // Aim from the offset origin to the actual sample (including near grazing).
     Vec org=p+n*eps,sd=source-org; float sl=sqrtf(dot(sd,sd));
-    float vis=visibility({org,sd*(1/sl)},sl-3*eps,balls,stage); if(vis==0) return grey(0);
+    float vis=cached>=0?cached:visibility({org,sd*(1/sl)},sl-3*eps,balls,stage); if(vis==0) return grey(0);
     float pdf; Vec f=brdf(m,n,wo,wi,pdf);
     if(!area) return f*intensity*(vis*c/d2); // radiant intensity, inverse square
     float lp=d2/(wi.y*light_area);
     return f*intensity*(vis*c*power_weight(area_samples*lp,pdf)/(lp*area_samples));
 }
-ACG_HD inline Vec lighting(Vec p,Vec n,Vec wo,Material m,const Balls &balls,int stage,Rng &rng) {
+ACG_HD inline Vec lighting(Vec p,Vec n,Vec wo,Material m,const Balls &balls,int stage,Rng &rng,const Hit& hit,bool analytic,float cached) {
     Vec I=stage==2?Vec{1.8f,1.63f,1.52f}:Vec{8.05f,7.35f,6.37f};
-    Vec out=direct_sample(p,n,wo,{-.73f,1.54f,-.46f},I,false,m,balls,stage);
+    Vec out=direct_sample(p,n,wo,{-.73f,1.54f,-.46f},I,false,m,balls,stage,cached);
     if(stage==2 && p.y<light_y) {
+        const bool eligible=analytic && soft_eligible(stage,hit,p,n,balls.c);
         for(int i=0;i<area_samples;++i) {
             float u=(i+rng.next())/area_samples,v=rng.next();
-            Vec q={(2*u-1)*light_hx,light_y,light_z+(2*v-1)*light_hz};
+            Vec q={(2*(eligible?u*area_samples-i:u)-1)*light_hx,light_y,light_z+(2*v-1)*light_hz};
+            SoftSlice slice;
+            if(eligible && soft_slice(p,balls.c,q.z,slice,soft_lamp,radius,eps)) {
+                Vec c=m.diffuse*(1/pi);
+                Vec sum=c*float(slice.geometry);
+                if(soft_visible(slice,q.x)) {
+                    Vec d=q-p; float d2=dot(d,d); Vec wi=d*(1/sqrtf(d2));
+                    float pdf; Vec f=brdf(m,n,wo,wi,pdf);
+                    float lp=d2/(wi.y*light_area);
+                    sum=sum+(f*power_weight(area_samples*lp,pdf)-c)*(2*light_hx*wi.y*wi.y/d2);
+                }
+                out=out+emission()*sum*(2*light_hz/area_samples);
+                continue;
+            }
             out=out+direct_sample(p,n,wo,q,emission(),true,m,balls,stage);
         }
     }
@@ -542,7 +581,7 @@ ACG_HD inline bool glass_bounce(Vec d,Vec n,bool entering,Rng &rng,Vec &dir,floa
     if(rng.next()<R) { dir=unit(d+n*(2*ci)); weight=1; return false; }
     dir=unit(d*eta+n*(eta*ci-ct)); weight=eta*eta; return true;
 }
-ACG_HD inline Vec trace(Ray ray,const Balls &balls,int stage,float t,Rng &rng) {
+ACG_HD inline Vec trace(Ray ray,const Balls &balls,int stage,float t,Rng &rng,bool analytic=false,float cached=-1) {
     Vec out={},beta=grey(1),prev={}; float prev_pdf=0,eta_scale=1; bool delta=true,inside=false;
     for(int depth=0;depth<14;++depth) {
         Hit hit; float t0=eps;
@@ -576,7 +615,8 @@ ACG_HD inline Vec trace(Ray ray,const Balls &balls,int stage,float t,Rng &rng) {
             delta=true;
         } else {
             Material m=material(hit,p,balls,t,stage);
-            out=out+beta*lighting(p,n,wo,m,balls,stage,rng);
+            const float vis=depth==0 && hit.mat==Felt && n.y==1 && fabsf(p.y)<eps?cached:-1.f;
+            out=out+beta*lighting(p,n,wo,m,balls,stage,rng,hit,analytic,vis);
             if(stage==0) break;
             wi=sample_direction(m,n,wo,rng); float c=dot(wi,n);
             if(c<=0) break;
@@ -619,12 +659,13 @@ ACG_HD inline Ray camera(int x,int y,int w,int h,int stage,Rng &rng) {
 // the caller supplies snapshots at shutter times. Without one, time is seconds
 // on the built-in demonstration and each path samples a centred 1/48 s shutter.
 ACG_HD inline Vec sample_pixel(int x,int y,int w,int h,int stage,unsigned seed,float time,
-                               const float *balls=nullptr) {
+                               const float *balls=nullptr,const acg_scene_detail::BallBVH* tree=nullptr,bool analytic=false,float cached=-1) {
     using namespace acg_scene_detail;
     Rng rng={hash32(seed^hash32(uint32_t(x)+0x9e3779b9u)^hash32(uint32_t(y)+0x243f6a88u))};
     stage=stage<0?0:(stage>2?2:stage);
     float t=balls?0.f:(stage==0?time:time+(rng.next()-.5f)*(1.f/48));
     Balls poses; place_balls(poses,t,balls);
-    Ray r=camera(x,y,w,h,stage,rng); return trace(r,poses,stage,t,rng);
+    poses.tree=tree;
+    Ray r=camera(x,y,w,h,stage,rng); return trace(r,poses,stage,t,rng,analytic,cached);
 }
 #endif

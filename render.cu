@@ -23,12 +23,20 @@
 #define RENDER_HD
 #endif
 #include "scene.h"
+using acg_scene_detail::BallBVH;
+#include "sequence.h"
+#include "interpolate.h"
 #ifdef __CUDACC__
 __constant__ float device_balls[64 * 32];
 #endif
 
 namespace {
 using Clock = std::chrono::steady_clock;
+#ifdef ACG_ANALYTIC_SHADOW
+constexpr bool analytic_shadow=true;
+#else
+constexpr bool analytic_shadow=false;
+#endif
 using u32 = std::uint32_t;
 constexpr u32 base_seed = 0x63d83595u;
 struct RGB8 { unsigned char r, g, b; };
@@ -49,7 +57,7 @@ RENDER_HD inline unsigned char display_byte(float linear) {
     return static_cast<unsigned char>(255.0f * s + 0.5f);
 }
 
-RENDER_HD inline RGB8 render_pixel(int x, int y, int w, int h, int stage, int spp, float time, const float* balls, unsigned poses) {
+RENDER_HD inline RGB8 render_pixel(int x, int y, int w, int h, int stage, int spp, float time, const float* balls, unsigned poses, const BallBVH* trees,float cached=-1) {
     // No dependency on launch order, stage, spp budget or time. Matching pixels
     // share the same prefix of random samples in all comparison renders.
     const u32 pixel_key = mix_bits(base_seed ^ static_cast<u32>(y)) ^ static_cast<u32>(x);
@@ -58,7 +66,7 @@ RENDER_HD inline RGB8 render_pixel(int x, int y, int w, int h, int stage, int sp
     for (int s = 0; s < spp; ++s) {
         const u32 seed = mix_bits(first + static_cast<u32>(s));
         const unsigned pose = (static_cast<std::uint64_t>(mix_bits(seed ^ 0xba7c19u)) * poses) >> 32;
-        const Vec v = sample_pixel(x, y, w, h, stage, seed ? seed : base_seed, time, balls + 32 * pose);
+        const Vec v = sample_pixel(x, y, w, h, stage, seed ? seed : base_seed, time, balls + 32 * pose, trees?trees+pose:nullptr,analytic_shadow,cached);
         r += v.x; g += v.y; b += v.z;
     }
     const float inv = 1.0f / spp;
@@ -66,10 +74,10 @@ RENDER_HD inline RGB8 render_pixel(int x, int y, int w, int h, int stage, int sp
 }
 
 #ifdef __CUDACC__
-__global__ void render_pixels(RGB8* pixels, size_t count, int w, int h, int stage, int spp, float time, unsigned poses) {
+__global__ void render_pixels(RGB8* pixels, size_t count, int w, int h, int stage, int spp, float time, unsigned poses, const BallBVH* trees,const float* cache) {
     const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
     for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < count; i += stride)
-        pixels[i] = render_pixel(static_cast<int>(i % w), static_cast<int>(i / w), w, h, stage, spp, time, device_balls, poses);
+        pixels[i] = render_pixel(static_cast<int>(i % w), static_cast<int>(i / w), w, h, stage, spp, time, device_balls, trees,cache?cache[i]:-1.f);
 }
 
 void check(cudaError_t e, const char* operation) {
@@ -111,38 +119,103 @@ int main(int argc, char** argv) try {
     const int w = integer(argv[2], 1, imax, "width"), h = integer(argv[3], 1, imax, "height");
     const int spp = integer(argv[4], 1, imax, "spp");
     const float time = scene_time(argv[6]);
+    const bool sequence_mode=argc==8 && std::strcmp(argv[5],"--sequence")==0;
+    const auto frames=sequence_mode?sequence::read_manifest(argv[7]):std::vector<sequence::Frame>{};
     float balls[64 * 32];
-    const unsigned poses = argc - 7;
-    for (unsigned i = 0; i < poses; ++i) {
-        std::ifstream snapshot(argv[7 + i]);
-        for (unsigned j = 0; j < 32; ++j) {
-            float& value = balls[32 * i + j];
-            if (!(snapshot >> value) || !std::isfinite(value)) throw std::runtime_error("invalid physics snapshot");
-        }
-        std::string extra;
-        if (snapshot >> extra) throw std::runtime_error("extra physics snapshot values");
-    }
-    const auto total_start = Clock::now();
+    const unsigned poses=sequence_mode?1:argc-7;
+    BallBVH prior{};
     const std::uint64_t count64 = static_cast<std::uint64_t>(w) * h;
     if (count64 > std::numeric_limits<size_t>::max() / sizeof(RGB8) ||
         count64 > static_cast<std::uint64_t>(std::numeric_limits<std::streamsize>::max()) / sizeof(RGB8))
         throw std::length_error("image byte count exceeds platform limit");
     const size_t count = static_cast<size_t>(count64), bytes = count * sizeof(RGB8);
     std::unique_ptr<RGB8[]> image(new RGB8[count]);
+    std::vector<float> cache;
 #ifdef __CUDACC__
     cudaDeviceProp prop{};
     CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
     std::cerr << "CUDA device 0: " << prop.name << " (sm_" << prop.major << prop.minor << ")\n";
-    CUDA_CHECK(cudaMemcpyToSymbol(device_balls, balls, poses * 32 * sizeof(float)));
+    BallBVH* device_trees=nullptr;
+    float* device_cache=nullptr;
     RGB8* device = nullptr;
     CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&device), bytes));
     cudaEvent_t begin, end;
     CUDA_CHECK(cudaEventCreate(&begin));
     CUDA_CHECK(cudaEventCreate(&end));
     constexpr unsigned threads = 128;
+#endif
+    for(size_t frame=0;frame<(sequence_mode?frames.size():1);++frame) {
+    for(unsigned i=0;i<poses;++i) {
+        const auto data=sequence::load_snapshot(sequence_mode?frames[frame].snapshot_path:std::filesystem::path(argv[7+i]));
+        std::copy(data.begin(),data.end(),balls+32*i);
+    }
+    const auto total_start = Clock::now();
+    BallBVH trees[64];
+    const char* query=std::getenv("ACG_BVH");
+    const bool use_tree=query && (std::strcmp(query,"rebuild")==0 || std::strcmp(query,"refit")==0);
+    if(query && !use_tree && std::strcmp(query,"scan")!=0)
+        throw std::runtime_error("ACG_BVH must be scan, rebuild or refit");
+    for(unsigned i=0;use_tree && i<poses;++i) {
+        acg_scene_detail::Balls state;
+        place_balls(state,time,balls+32*i);
+        if((i || frame) && std::strcmp(query,"refit")==0) {
+            trees[i]=i?trees[i-1]:prior;
+            refit_ball_bvh(trees[i],state);
+        } else build_ball_bvh(trees[i],state);
+        prior=trees[i];
+    }
+    const double prepare_ms=elapsed_ms(total_start);
+    std::cerr << "balls=" << (query?query:"scan") << " prepare_ms=" << prepare_ms << '\n';
+    const auto cache_start=Clock::now();
+    if(const char* setting=std::getenv("ACG_INTERPOLATE"); setting && poses==1) {
+        using namespace acg_scene_detail;
+        using namespace acg_interpolate;
+        Balls state;
+        place_balls(state,time,balls);
+        state.tree=use_tree?trees:nullptr;
+        Settings config;
+        config.spacing=integer(setting,1,64,"interpolation grid spacing");
+        cache.assign(count,-1.f);
+        struct Receiver : Guide { Vec point; };
+        auto guide=[&](int x,int y) {
+            Receiver g{};
+            float a=float(w)/h, v=hi(.77f,1.40f/a);
+            g.point={(2*(x+.5f)/w-1)*a*v,0,(2*(y+.5f)/h-1)*v};
+            constexpr float height=light_y-.12f;
+            Hit hit;
+            if(!intersect({g.point+Vec{0,height,0},{0,-1,0}},state,stage,eps,far_t,hit) ||
+               hit.mat!=Felt || hit.normal.y!=1 || fabsf(hit.t-height)>eps) return g;
+            // Exclude contacts and their nearby projected point-light shadows.
+            for(const auto& c:state.c)
+                if(dot(g.point-c,g.point-c)<.13f*.13f) return g;
+            g.smooth_diffuse=true; g.object=0; g.material=Felt; g.depth=hit.t; g.normal={0,1,0};
+            return g;
+        };
+        auto exact=[&](int,int,const Receiver& g) -> RGB {
+            if(!g.smooth_diffuse) return {};
+            Vec p=g.point+Vec{0,eps,0}, d=Vec{-.73f,1.54f,-.46f}-p;
+            float l=sqrtf(dot(d,d)), value=visibility({p,d*(1/l)},l-3*eps,state,stage);
+            return {value,value,value};
+        };
+        const auto stat=fixed_grid(w,h,config,guide,exact,[&](int x,int y,const Receiver&,RGB value,Source source) {
+            if(source==Source::interpolated) cache[size_t(y)*w+x]=value[0];
+        });
+        std::cerr << "interpolated=" << stat.interpolated << " pixels=" << count
+                  << " cache_ms=" << elapsed_ms(cache_start) << '\n';
+    }
+#ifdef __CUDACC__
+    CUDA_CHECK(cudaMemcpyToSymbol(device_balls, balls, poses * 32 * sizeof(float)));
+    if(use_tree) {
+        if(!device_trees) CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&device_trees),poses*sizeof(BallBVH)));
+        CUDA_CHECK(cudaMemcpy(device_trees,trees,poses*sizeof(BallBVH),cudaMemcpyHostToDevice));
+    }
+    if(!cache.empty()) {
+        if(!device_cache) CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&device_cache),count*sizeof(float)));
+        CUDA_CHECK(cudaMemcpy(device_cache,cache.data(),count*sizeof(float),cudaMemcpyHostToDevice));
+    }
     const unsigned blocks = static_cast<unsigned>(std::min<size_t>((count - 1) / threads + 1, 65535));
     CUDA_CHECK(cudaEventRecord(begin));
-    render_pixels<<<blocks, threads>>>(device, count, w, h, stage, spp, time, poses);
+    render_pixels<<<blocks, threads>>>(device, count, w, h, stage, spp, time, poses, device_trees, device_cache);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaEventRecord(end));
     CUDA_CHECK(cudaEventSynchronize(end));
@@ -151,31 +224,41 @@ int main(int argc, char** argv) try {
     const auto copy_start = Clock::now();
     CUDA_CHECK(cudaMemcpy(image.get(), device, bytes, cudaMemcpyDeviceToHost));
     const double d2h_ms = elapsed_ms(copy_start);
-    CUDA_CHECK(cudaEventDestroy(end));
-    CUDA_CHECK(cudaEventDestroy(begin));
-    CUDA_CHECK(cudaFree(device));
     constexpr const char* backend = "cuda";
 #else
     const auto render_start = Clock::now();
+#ifdef _OPENMP
+    #pragma omp parallel for schedule(dynamic, 4)
+#endif
     for (int y = 0; y < h; ++y)
         for (int x = 0; x < w; ++x)
-            image[static_cast<size_t>(y) * w + x] = render_pixel(x, y, w, h, stage, spp, time, balls, poses);
+            image[static_cast<size_t>(y) * w + x] = render_pixel(x, y, w, h, stage, spp, time, balls, poses, use_tree?trees:nullptr,
+                                                               cache.empty()?-1.f:cache[size_t(y)*w+x]);
     const double render_ms = elapsed_ms(render_start), d2h_ms = 0.0;
     constexpr const char* backend = "cpu";
 #endif
     const auto io_start = Clock::now();
-    std::ofstream out(argv[5], std::ios::binary);
+    std::ofstream out(sequence_mode?frames[frame].output_path:std::filesystem::path(argv[5]),std::ios::binary);
     out << "P6\n" << w << ' ' << h << "\n255\n";
     out.write(reinterpret_cast<const char*>(image.get()), static_cast<std::streamsize>(bytes));
     out.close();
-    if (!out) throw std::runtime_error(std::string("failed writing ") + argv[5]);
+    if (!out) throw std::runtime_error("failed writing output image");
     const double io_ms = elapsed_ms(io_start), total_ms = elapsed_ms(total_start);
     // render_ms = one kernel (sampling + tonemap) on CUDA, render loop on CPU.
-    // total_ms = cold invocation from buffer setup through PPM close, not FPS.
-    std::cout << "backend,stage,width,height,spp,time,base_seed,render_ms,d2h_wall_ms,ppm_wall_ms,total_wall_ms\n"
+    // Frame wall time excludes manifest/snapshot parsing and persistent device setup.
+    if(frame==0) std::cout << "backend,stage,width,height,spp,time,base_seed,render_ms,d2h_wall_ms,ppm_wall_ms,total_wall_ms,frame,prepare_ms\n";
+    std::cout
               << backend << ',' << stage << ',' << w << ',' << h << ',' << spp << ',' << std::setprecision(9)
               << time << ',' << base_seed << ',' << std::fixed << std::setprecision(3) << render_ms << ','
-              << d2h_ms << ',' << io_ms << ',' << total_ms << '\n';
+              << d2h_ms << ',' << io_ms << ',' << total_ms << ',' << frame << ',' << prepare_ms << '\n';
+    }
+#ifdef __CUDACC__
+    CUDA_CHECK(cudaEventDestroy(end));
+    CUDA_CHECK(cudaEventDestroy(begin));
+    CUDA_CHECK(cudaFree(device));
+    if(device_trees) CUDA_CHECK(cudaFree(device_trees));
+    if(device_cache) CUDA_CHECK(cudaFree(device_cache));
+#endif
     return 0;
 } catch (const std::exception& e) {
     std::cerr << "render: " << e.what() << '\n';
