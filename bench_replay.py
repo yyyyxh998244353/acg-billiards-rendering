@@ -32,21 +32,55 @@ def run(binary, mode, spacing, spp, args, folder):
     return rows
 
 
-def error(image_path, reference_path):
-    def load(path):
-        with path.open('rb') as f:
-            if f.readline() != b'P6\n':
-                raise ValueError(f'Expected binary PPM: {path}')
-            w, h = map(int, f.readline().split())
-            pixels = f.read() if f.readline() == b'255\n' else b''
-            if w <= 0 or h <= 0 or len(pixels) != 3*w*h:
-                raise ValueError(f'Invalid PPM: {path}')
-            return (w, h), pixels
-    size, image = load(image_path)
-    ref_size, ref = load(reference_path)
-    if size != ref_size:
-        raise ValueError(f'Mismatched reference: {image_path}')
-    return sum((a-b)**2 for a, b in zip(image, ref)) / (len(ref)*255**2)
+def load_ppm(path):
+    with path.open('rb') as f:
+        if f.readline() != b'P6\n':
+            raise ValueError(f'Expected binary PPM: {path}')
+        w, h = map(int, f.readline().split())
+        pixels = f.read() if f.readline() == b'255\n' else b''
+        if w <= 0 or h <= 0 or len(pixels) != 3*w*h:
+            raise ValueError(f'Invalid PPM: {path}')
+        return (w, h), pixels
+
+
+def ball_roi(args, frame):
+    w, h = args.width, args.height
+    scale = h / (2*max(.77, 1.40/(w/h)))
+    coords = list(map(float, (args.snapshots / f'frame_{frame:06d}.txt').read_text().split()))
+    pixels = set()
+    radius = .11*scale
+    for x, z in zip(coords[::2], coords[1::2]):
+        cx, cy = w/2 + scale*x, h/2 + scale*z
+        for row in range(max(0, math.floor(cy-radius)), min(h, math.ceil(cy+radius))):
+            for col in range(max(0, math.floor(cx-radius)), min(w, math.ceil(cx+radius))):
+                if (col+.5-cx)**2 + (row+.5-cy)**2 <= radius**2:
+                    pixels.add(row*w+col)
+    return pixels
+
+
+def quality(folder, ref, args):
+    spatial = roi = temporal = 0
+    roi_count = temporal_count = 0
+    previous = previous_roi = None
+    for j in range(args.warmup, len(args.frames)):
+        size, image = load_ppm(folder / f'{j:04d}.ppm')
+        ref_size, reference = load_ppm(ref / f'{j:04d}.ppm')
+        if size != ref_size or size != (args.width, args.height):
+            raise ValueError(f'Mismatched frame in {folder}: {j}')
+        residual = [a-b for a, b in zip(image, reference)]
+        region = ball_roi(args, args.frames[j])
+        spatial += sum(d*d for d in residual)
+        roi += sum(residual[3*i+c]**2 for i in region for c in range(3))
+        roi_count += 3*len(region)
+        if previous is not None and args.frames[j] == args.frames[j-1]+1:
+            union = region | previous_roi
+            temporal += sum((residual[3*i+c]-previous[3*i+c])**2 for i in union for c in range(3))
+            temporal_count += 3*len(union)
+        previous, previous_roi = residual, region
+    def rmse(sumsq, count):
+        return math.sqrt(sumsq/count)/255 if count else ''
+    return (rmse(spatial, (len(args.frames)-args.warmup)*args.width*args.height*3),
+            rmse(roi, roi_count), rmse(temporal, temporal_count))
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
@@ -74,17 +108,16 @@ def main():
                 ('combined', a.analytic, 'refit', 4)]
     with (a.output / 'summary.csv').open('w', newline='') as f:
         out = csv.writer(f)
-        out.writerow(['variant', 'spp', 'frames', 'compute_p50_ms', 'compute_p95_ms', 'display_rgb_rmse'])
+        out.writerow(['variant', 'spp', 'frames', 'compute_p50_ms', 'compute_p95_ms',
+                      'display_rgb_rmse', 'ball_neighborhood_rmse', 'adjacent_roi_residual_delta_rmse'])
         for spp in sorted(set(a.spp)):
             for name, binary, mode, spacing in variants:
                 folder = a.output / f'{name}-{spp}'
                 rows = run(binary, mode, spacing, spp, a, folder)
                 times = sorted(float(row['total_wall_ms']) - float(row['ppm_wall_ms'])
                                for row in rows[a.warmup:])
-                mse = [error(folder / f'{j:04d}.ppm', ref / f'{j:04d}.ppm')
-                       for j in range(a.warmup, len(rows))]
                 out.writerow([name, spp, len(times), statistics.median(times),
-                              times[math.ceil(.95*len(times))-1], math.sqrt(statistics.mean(mse))])
+                              times[math.ceil(.95*len(times))-1], *quality(folder, ref, a)])
                 f.flush()
 
 
