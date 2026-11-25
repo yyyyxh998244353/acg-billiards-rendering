@@ -242,6 +242,9 @@ int main(int argc, char** argv) try {
 #else
     constexpr double upload_ms=0;
     const auto render_start = Clock::now();
+#ifdef ACG_COUNT_TRAVERSAL
+    acg_scene_detail::ball_counters={};
+#endif
 #ifdef _OPENMP
     #pragma omp parallel for schedule(dynamic, 4)
 #endif
@@ -250,6 +253,11 @@ int main(int argc, char** argv) try {
             image[static_cast<size_t>(y) * w + x] = render_pixel(x,y,w,h,stage,spp,prepared,poses,sample_seed,
                                                                cache.empty()?-1.f:cache[size_t(y)*w+x]);
     const double render_ms = elapsed_ms(render_start), d2h_ms = 0.0;
+#ifdef ACG_COUNT_TRAVERSAL
+    const auto& counters=acg_scene_detail::ball_counters;
+    std::cerr << "traversal," << frame << ',' << counters.rays << ','
+              << counters.boxes << ',' << counters.spheres << '\n';
+#endif
     constexpr const char* backend = "cpu";
 #endif
     double io_ms=0;

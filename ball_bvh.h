@@ -77,8 +77,14 @@ ACG_HD inline bool intersect_ball_bvh(const BallBVH &tree,const Balls &balls,Ray
     int slot=BallBVH::slot_count;
     for(int i=0;i<BallBVH::node_count;) {
         int tag=tree.tag[i];
+#ifdef ACG_COUNT_TRAVERSAL
+        ++ball_counters.boxes;
+#endif
         if(!overlaps(tree.box[i],r,inv,t0,best)) { i=tag<0?-tag:i+1; continue; }
         if(tag>=0) {
+#ifdef ACG_COUNT_TRAVERSAL
+            ++ball_counters.spheres;
+#endif
             // sphere_t has a strict upper bound. Use the incoming limit here
             // so a later leaf can still win an exact-distance tie by slot.
             float t;

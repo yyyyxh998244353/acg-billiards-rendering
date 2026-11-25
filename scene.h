@@ -199,6 +199,13 @@ ACG_HD inline bool sphere_t(Ray r,Vec c,float rad,float tmin,float tmax,float &t
     float root=sqrtf(q); t=proj-root; if(t<=tmin) t=proj+root;
     return t>tmin && t<tmax;
 }
+#ifdef ACG_COUNT_TRAVERSAL
+#if defined(__CUDACC__) || defined(_OPENMP)
+#error ACG_COUNT_TRAVERSAL requires a serial CPU build
+#endif
+struct BallCounters { uint64_t rays=0, boxes=0, spheres=0; };
+inline BallCounters ball_counters;
+#endif
 #include "ball_bvh.h"
 ACG_HD inline float pocket_distance2(Vec v) {
     float x=fabsf(v.x); x=x>pocket_x*.5f?x-pocket_x:x;
@@ -303,10 +310,17 @@ ACG_HD constexpr Vec emission() { return {12.0f,10.9f,9.4f}; }
 #include "soft_intervals.h"
 ACG_HD inline bool intersect(Ray r,const Balls &balls,int stage,float t0,float t1,Hit &h) {
     h.t=t1; Vec inv=invdir(r.d);
+#ifdef ACG_COUNT_TRAVERSAL
+    ++ball_counters.rays;
+    if(!balls.tree) ++ball_counters.boxes;
+#endif
     if(balls.tree) {
         intersect_ball_bvh(*balls.tree,balls,r,inv,t0,h);
     } else if(overlaps(balls.box,r,inv,t0,h.t)) {
         for(int i=0;i<16;++i) {
+#ifdef ACG_COUNT_TRAVERSAL
+            ++ball_counters.spheres;
+#endif
             float t;
             if(sphere_t(r,balls.c[i],radius,t0,h.t,t)) record(h,t,unit((r.o-balls.c[i])+r.d*t),Ball,i);
         }
