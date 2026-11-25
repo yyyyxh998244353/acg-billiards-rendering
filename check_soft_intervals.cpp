@@ -61,5 +61,25 @@ int main() {
             }
         }
     }
+    {
+        Balls balls{};
+        float positions[32];
+        for(auto& position:positions) position=9;
+        place_balls(balls,0,positions);
+        const Vec n={0,1,0}, q={0,light_y,-.9f};
+        const Material m=varnish({.4f,.3f,.2f},.6f);
+        const Vec delta=q-p;
+        const float d2=dot(delta,delta);
+        const Vec wi=unit(delta);
+        float pdf;
+        const Vec f=brdf(m,n,n,wi,pdf);
+        const Vec expected=f*emission()*(wi.y*wi.y*light_area/(d2*area_samples));
+        const Vec terminal=direct_sample(p,n,n,q,emission(),true,m,balls,2,1,false);
+        if(fabsf(terminal.x-expected.x)>1e-6f || fabsf(terminal.y-expected.y)>1e-6f ||
+           fabsf(terminal.z-expected.z)>1e-6f) {
+            std::fputs("Terminal area sample lost unopposed light energy\n",stderr);
+            return 1;
+        }
+    }
     std::puts("72 quadrature slices plus full blockage and plane tangency passed.");
 }
