@@ -16,6 +16,14 @@ For a replay, put one `snapshot.txt output.ppm` pair per line in a manifest (pat
 ACG_BVH=refit ./render_cpu 2 1280 720 1 --sequence 0 replay.txt > timings.csv
 ```
 
+To generate physics snapshots, render, and encode an animated WebP in one command (Python with Pillow):
+
+```sh
+python3 preview_replay.py ./render_cpu outputs/my-replay --width 128 --height 72 --last-frame 16
+```
+
+Use a fresh output directory. For cluster GPU runs, invoke with `--phase prepare` before allocation, `--phase render` inside the allocation, and `--phase encode` after release. Pass the same dimensions, frame count and frame rate to each phase. Only `all` and `encode` require Pillow; the script never submits Slurm jobs.
+
 `ACG_BVH=scan|rebuild|refit` selects ball traversal (default `scan`). `ACG_INTERPOLATE=4` enables the first-hit felt point-shadow cache for single-pose frames. Build with `-DACG_ANALYTIC_SHADOW` to enable the separate rectangular-light estimator. Keep these options off for the reference. Frame CSV separates geometry preparation, cache, upload, render, readback, and file output.
 
 To compile CUDA without reserving a GPU: `nvcc -O3 -std=c++17 -arch=sm_90 -Xptxas=-v render.cu -o render_gpu` (use `sm_80` for A100). Do not submit `run.slurm` under a one-second allocation limit: the script's guard is checked only after Slurm has allocated a device.
