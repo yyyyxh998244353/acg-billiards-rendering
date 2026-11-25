@@ -28,6 +28,8 @@ Use a fresh output directory. For cluster GPU runs, invoke with `--phase prepare
 
 To compile CUDA without reserving a GPU: `nvcc -O3 -std=c++17 -arch=sm_90 -Xptxas=-v render.cu -o render_gpu` (use `sm_80` for A100). Do not submit `run.slurm` under a one-second allocation limit: the script's guard is checked only after Slurm has allocated a device.
 
+For the faster preview build, add `-DACG_MAX_HITS=2` and render at `--spp 6`. This trades higher-order indirect lighting for more camera samples. Keep the default 14 surface hits for reference images.
+
 | Project Announcement §5.1 basic item | Implementation / evidence |
 |---|---|
 | Path tracing; diffuse and specular | Stages 1–2 in `scene.h`; stage 0 is diagnostic direct lighting only. |
