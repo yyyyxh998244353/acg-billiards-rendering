@@ -546,6 +546,25 @@ ACG_HD inline Vec direct_sample(Vec p,Vec n,Vec wo,Vec source,Vec intensity,bool
     float lp=d2/(wi.y*light_area);
     return f*intensity*(vis*c*power_weight(area_samples*lp,pdf)/(lp*area_samples));
 }
+#ifdef __CUDACC__
+ACG_HD __noinline__
+#else
+inline
+#endif
+bool analytic_area_sample(Vec p,Vec n,Vec wo,Vec q,Material m,const Balls& balls,Vec& result) {
+    SoftSlice slice;
+    if(!soft_slice(p,balls.c,q.z,slice,soft_lamp,radius,eps)) return false;
+    Vec c=m.diffuse*(1/pi);
+    Vec sum=c*float(slice.geometry);
+    if(soft_visible(slice,q.x)) {
+        Vec d=q-p; float d2=dot(d,d); Vec wi=d*(1/sqrtf(d2));
+        float pdf; Vec f=brdf(m,n,wo,wi,pdf);
+        float lp=d2/(wi.y*light_area);
+        sum=sum+(f*power_weight(area_samples*lp,pdf)-c)*(2*light_hx*wi.y*wi.y/d2);
+    }
+    result=emission()*sum*(2*light_hz/area_samples);
+    return true;
+}
 ACG_HD inline Vec lighting(Vec p,Vec n,Vec wo,Material m,const Balls &balls,int stage,Rng &rng,const Hit& hit,bool analytic,float cached) {
     Vec I=stage==2?Vec{1.8f,1.63f,1.52f}:Vec{8.05f,7.35f,6.37f};
     Vec out=direct_sample(p,n,wo,{-.73f,1.54f,-.46f},I,false,m,balls,stage,cached);
@@ -554,17 +573,9 @@ ACG_HD inline Vec lighting(Vec p,Vec n,Vec wo,Material m,const Balls &balls,int 
         for(int i=0;i<area_samples;++i) {
             float u=(i+rng.next())/area_samples,v=rng.next();
             Vec q={(2*(eligible?u*area_samples-i:u)-1)*light_hx,light_y,light_z+(2*v-1)*light_hz};
-            SoftSlice slice;
-            if(eligible && soft_slice(p,balls.c,q.z,slice,soft_lamp,radius,eps)) {
-                Vec c=m.diffuse*(1/pi);
-                Vec sum=c*float(slice.geometry);
-                if(soft_visible(slice,q.x)) {
-                    Vec d=q-p; float d2=dot(d,d); Vec wi=d*(1/sqrtf(d2));
-                    float pdf; Vec f=brdf(m,n,wo,wi,pdf);
-                    float lp=d2/(wi.y*light_area);
-                    sum=sum+(f*power_weight(area_samples*lp,pdf)-c)*(2*light_hx*wi.y*wi.y/d2);
-                }
-                out=out+emission()*sum*(2*light_hz/area_samples);
+            Vec contribution;
+            if(eligible && analytic_area_sample(p,n,wo,q,m,balls,contribution)) {
+                out=out+contribution;
                 continue;
             }
             out=out+direct_sample(p,n,wo,q,emission(),true,m,balls,stage);

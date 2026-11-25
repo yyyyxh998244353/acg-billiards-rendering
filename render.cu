@@ -77,7 +77,7 @@ RENDER_HD inline RGB8 render_pixel(int x, int y, int w, int h, int stage, int sp
 __global__ void render_pixels(RGB8* pixels, size_t count, int w, int h, int stage, int spp, float time, unsigned poses, const BallBVH* trees,const float* cache) {
     const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
     for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < count; i += stride)
-        pixels[i] = render_pixel(static_cast<int>(i % w), static_cast<int>(i / w), w, h, stage, spp, time, device_balls, trees,cache?cache[i]:-1.f);
+        pixels[i] = render_pixel(static_cast<int>(i % w), static_cast<int>(i / w), w, h, stage, spp, time, device_balls, poses, trees,cache?cache[i]:-1.f);
 }
 
 void check(cudaError_t e, const char* operation) {
@@ -203,7 +203,9 @@ int main(int argc, char** argv) try {
         std::cerr << "interpolated=" << stat.interpolated << " pixels=" << count
                   << " cache_ms=" << elapsed_ms(cache_start) << '\n';
     }
+    const double cache_ms=elapsed_ms(cache_start);
 #ifdef __CUDACC__
+    const auto upload_start=Clock::now();
     CUDA_CHECK(cudaMemcpyToSymbol(device_balls, balls, poses * 32 * sizeof(float)));
     if(use_tree) {
         if(!device_trees) CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&device_trees),poses*sizeof(BallBVH)));
@@ -213,6 +215,7 @@ int main(int argc, char** argv) try {
         if(!device_cache) CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&device_cache),count*sizeof(float)));
         CUDA_CHECK(cudaMemcpy(device_cache,cache.data(),count*sizeof(float),cudaMemcpyHostToDevice));
     }
+    const double upload_ms=elapsed_ms(upload_start);
     const unsigned blocks = static_cast<unsigned>(std::min<size_t>((count - 1) / threads + 1, 65535));
     CUDA_CHECK(cudaEventRecord(begin));
     render_pixels<<<blocks, threads>>>(device, count, w, h, stage, spp, time, poses, device_trees, device_cache);
@@ -226,6 +229,7 @@ int main(int argc, char** argv) try {
     const double d2h_ms = elapsed_ms(copy_start);
     constexpr const char* backend = "cuda";
 #else
+    constexpr double upload_ms=0;
     const auto render_start = Clock::now();
 #ifdef _OPENMP
     #pragma omp parallel for schedule(dynamic, 4)
@@ -246,11 +250,11 @@ int main(int argc, char** argv) try {
     const double io_ms = elapsed_ms(io_start), total_ms = elapsed_ms(total_start);
     // render_ms = one kernel (sampling + tonemap) on CUDA, render loop on CPU.
     // Frame wall time excludes manifest/snapshot parsing and persistent device setup.
-    if(frame==0) std::cout << "backend,stage,width,height,spp,time,base_seed,render_ms,d2h_wall_ms,ppm_wall_ms,total_wall_ms,frame,prepare_ms\n";
+    if(frame==0) std::cout << "backend,stage,width,height,spp,time,base_seed,render_ms,d2h_wall_ms,ppm_wall_ms,total_wall_ms,frame,prepare_ms,cache_ms,upload_ms\n";
     std::cout
               << backend << ',' << stage << ',' << w << ',' << h << ',' << spp << ',' << std::setprecision(9)
               << time << ',' << base_seed << ',' << std::fixed << std::setprecision(3) << render_ms << ','
-              << d2h_ms << ',' << io_ms << ',' << total_ms << ',' << frame << ',' << prepare_ms << '\n';
+              << d2h_ms << ',' << io_ms << ',' << total_ms << ',' << frame << ',' << prepare_ms << ',' << cache_ms << ',' << upload_ms << '\n';
     }
 #ifdef __CUDACC__
     CUDA_CHECK(cudaEventDestroy(end));
