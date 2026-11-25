@@ -12,6 +12,10 @@
 # Submit from the directory containing render.cu and scene.h. WIDTH, HEIGHT,
 # SPP and SCENE_TIME can be changed together for all three comparisons.
 set -euo pipefail
+if [[ ${ACG_GPU_ALLOCATION_APPROVED:-} != yes ]]; then
+    echo 'GPU execution requires explicit allocation approval; compile offline otherwise.' >&2
+    exit 2
+fi
 src=${SLURM_SUBMIT_DIR:?requires Slurm}
 job_dir="$src/runs/${SLURM_JOB_ID:?}"
 mkdir -p "$src/runs"

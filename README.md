@@ -10,6 +10,16 @@ python3 physics.py snapshots --seed 42 --fps 60 --frames 0 90
 
 Pass additional uniformly spaced snapshots after the first snapshot to sample an exposure interval. The CPU backend does not require CUDA.
 
+For a replay, put one `snapshot.txt output.ppm` pair per line in a manifest (paths relative to the manifest; quote paths containing spaces):
+
+```sh
+ACG_BVH=refit ./render_cpu 2 1280 720 1 --sequence 0 replay.txt > timings.csv
+```
+
+`ACG_BVH=scan|rebuild|refit` selects ball traversal (default `scan`). `ACG_INTERPOLATE=4` enables the first-hit felt point-shadow cache for single-pose frames. Build with `-DACG_ANALYTIC_SHADOW` to enable the separate rectangular-light estimator. Keep these options off for the reference. Frame CSV separates geometry preparation, cache, upload, render, readback, and file output.
+
+To compile CUDA without reserving a GPU: `nvcc -O3 -std=c++17 -arch=sm_90 -Xptxas=-v render.cu -o render_gpu` (use `sm_80` for A100). Do not submit `run.slurm` under a one-second allocation limit: the script's guard is checked only after Slurm has allocated a device.
+
 | Project Announcement §5.1 basic item | Implementation / evidence |
 |---|---|
 | Path tracing; diffuse and specular | Stages 1–2 in `scene.h`; stage 0 is diagnostic direct lighting only. |
