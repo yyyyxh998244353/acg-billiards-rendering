@@ -15,8 +15,9 @@ def run(binary, mode, spacing, spp, args, folder):
         f'"{args.snapshots / f"frame_{i:06d}.txt"}" "{j:04d}.ppm"\n'
         for j, i in enumerate(args.frames)), encoding='utf-8')
     env = {k: v for k, v in os.environ.items()
-           if k not in {'ACG_INTERPOLATE', 'ACG_TIMING_ONLY', 'ACG_BVH'}}
+           if k not in {'ACG_INTERPOLATE', 'ACG_TIMING_ONLY', 'ACG_BVH', 'ACG_SAMPLE_SEED'}}
     env['ACG_BVH'] = mode
+    env['ACG_SAMPLE_SEED'] = str(args.reference_seed if folder.name == 'reference' else args.seed)
     if spacing:
         env['ACG_INTERPOLATE'] = str(spacing)
     with (folder / 'timings.csv').open('w') as timings, (folder / 'renderer.log').open('w') as log:
@@ -92,6 +93,8 @@ def main():
     p.add_argument('--frames', type=int, nargs='+', default=list(range(91)))
     p.add_argument('--spp', type=int, nargs='+', default=[1, 2, 4])
     p.add_argument('--reference-spp', type=int, default=128)
+    p.add_argument('--seed', type=int, default=0x63d83595)
+    p.add_argument('--reference-seed', type=int, default=20261126)
     p.add_argument('--warmup', type=int, default=1)
     a = p.parse_args()
     if a.backend == 'cuda' and os.environ.get('ACG_GPU_ALLOCATION_APPROVED') != 'yes':

@@ -55,10 +55,10 @@ RENDER_HD inline unsigned char display_byte(float linear) {
     return static_cast<unsigned char>(255.0f * s + 0.5f);
 }
 
-RENDER_HD inline RGB8 render_pixel(int x, int y, int w, int h, int stage, int spp, const Balls* balls, unsigned poses,float cached=-1) {
+RENDER_HD inline RGB8 render_pixel(int x,int y,int w,int h,int stage,int spp,const Balls* balls,unsigned poses,u32 sample_seed,float cached=-1) {
     // No dependency on launch order, stage, spp budget or time. Matching pixels
     // share the same prefix of random samples in all comparison renders.
-    const u32 pixel_key = mix_bits(base_seed ^ static_cast<u32>(y)) ^ static_cast<u32>(x);
+    const u32 pixel_key = mix_bits(sample_seed ^ static_cast<u32>(y)) ^ static_cast<u32>(x);
     const u32 first = mix_bits(pixel_key);
     float r = 0, g = 0, b = 0;
     for (int s = 0; s < spp; ++s) {
@@ -75,10 +75,10 @@ RENDER_HD inline RGB8 render_pixel(int x, int y, int w, int h, int stage, int sp
 }
 
 #ifdef __CUDACC__
-__global__ void render_pixels(RGB8* pixels, size_t count, int w, int h, int stage, int spp, const Balls* device_balls,unsigned poses,const float* cache) {
+__global__ void render_pixels(RGB8* pixels,size_t count,int w,int h,int stage,int spp,const Balls* device_balls,unsigned poses,u32 sample_seed,const float* cache) {
     const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
     for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < count; i += stride)
-        pixels[i] = render_pixel(static_cast<int>(i % w), static_cast<int>(i / w), w, h, stage, spp, device_balls, poses,cache?cache[i]:-1.f);
+        pixels[i] = render_pixel(static_cast<int>(i % w),static_cast<int>(i / w),w,h,stage,spp,device_balls,poses,sample_seed,cache?cache[i]:-1.f);
 }
 
 void check(cudaError_t e, const char* operation) {
@@ -120,6 +120,8 @@ int main(int argc, char** argv) try {
     const int w = integer(argv[2], 1, imax, "width"), h = integer(argv[3], 1, imax, "height");
     const int spp = integer(argv[4], 1, imax, "spp");
     const float time = scene_time(argv[6]);
+    const char* seed_env=std::getenv("ACG_SAMPLE_SEED");
+    const u32 sample_seed=seed_env?static_cast<u32>(integer(seed_env,0,imax,"sample seed")):base_seed;
     const bool sequence_mode=argc==8 && std::strcmp(argv[5],"--sequence")==0;
     const char* timing=std::getenv("ACG_TIMING_ONLY");
     const bool timing_only=timing && std::strcmp(timing,"1")==0;
@@ -227,7 +229,7 @@ int main(int argc, char** argv) try {
     const double upload_ms=elapsed_ms(upload_start);
     const unsigned blocks = static_cast<unsigned>(std::min<size_t>((count - 1) / threads + 1, 65535));
     CUDA_CHECK(cudaEventRecord(begin));
-    render_pixels<<<blocks, threads>>>(device, count, w, h, stage, spp, device_balls, poses, device_cache);
+    render_pixels<<<blocks, threads>>>(device,count,w,h,stage,spp,device_balls,poses,sample_seed,device_cache);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaEventRecord(end));
     CUDA_CHECK(cudaEventSynchronize(end));
@@ -245,7 +247,7 @@ int main(int argc, char** argv) try {
 #endif
     for (int y = 0; y < h; ++y)
         for (int x = 0; x < w; ++x)
-            image[static_cast<size_t>(y) * w + x] = render_pixel(x, y, w, h, stage, spp, prepared, poses,
+            image[static_cast<size_t>(y) * w + x] = render_pixel(x,y,w,h,stage,spp,prepared,poses,sample_seed,
                                                                cache.empty()?-1.f:cache[size_t(y)*w+x]);
     const double render_ms = elapsed_ms(render_start), d2h_ms = 0.0;
     constexpr const char* backend = "cpu";
@@ -266,7 +268,7 @@ int main(int argc, char** argv) try {
     if(frame==0) std::cout << "backend,stage,width,height,spp,time,base_seed,render_ms,d2h_wall_ms,ppm_wall_ms,total_wall_ms,frame,prepare_ms,cache_ms,upload_ms\n";
     std::cout
               << backend << ',' << stage << ',' << w << ',' << h << ',' << spp << ',' << std::setprecision(9)
-              << time << ',' << base_seed << ',' << std::fixed << std::setprecision(3) << render_ms << ','
+              << time << ',' << sample_seed << ',' << std::fixed << std::setprecision(3) << render_ms << ','
               << d2h_ms << ',' << io_ms << ',' << total_ms << ',' << frame << ',' << prepare_ms << ',' << cache_ms << ',' << upload_ms << '\n';
     }
 #ifdef __CUDACC__
