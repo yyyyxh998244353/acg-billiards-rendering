@@ -304,7 +304,11 @@ ACG_HD inline void primitive(const Prim &p,Ray r,Vec inv,float t0,Hit &h) {
     }
 }
 
-constexpr float light_y=1.37f,light_z=-1.08f,light_hx=.79f,light_hz=.215f;
+#ifndef ACG_LIGHT_HALF_WIDTH
+#define ACG_LIGHT_HALF_WIDTH .215f
+#endif
+constexpr float light_y=1.37f,light_z=-1.08f,light_hx=.79f,light_hz=ACG_LIGHT_HALF_WIDTH;
+static_assert(light_hz>0,"Emitter half width must be positive");
 constexpr float light_area=4*light_hx*light_hz;
 ACG_HD constexpr Vec emission() { return {12.0f,10.9f,9.4f}; }
 #include "soft_intervals.h"
