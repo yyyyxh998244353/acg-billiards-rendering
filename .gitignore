@@ -1,0 +1,8 @@
+/outputs/
+/snapshots/
+/runs/
+/baselines/
+__pycache__/
+*.ppm
+render_cpu
+render_cpu.exe
