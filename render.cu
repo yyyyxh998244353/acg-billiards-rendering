@@ -63,6 +63,7 @@ RENDER_HD inline RowSeed row_seed(int y,u32 sample_seed) {
 struct Sampling {
     int local_spp=0,background_spp=0;
     bool random_light=false;
+    bool local_sobol=false;
 };
 constexpr float ball_detail_radius=.080f;
 
@@ -145,10 +146,13 @@ RENDER_HD inline RGB8 render_pixel(int x,int y,int w,int h,int stage,int spp,con
     const u32 first = mix_bits(row.sample_key ^ column);
     const u32 path_key = row.path_key ^ hash32(column + 0x9e3779b9u);
     const float footprint=camera_pixel_width(w,h);
+    bool sobol=false;
     if(sampling.local_spp || sampling.background_spp) {
         const Vec point=camera_plane(x+.5f,y+.5f,w,h,footprint);
-        if(sampling.local_spp && near_ball_pixel(point,*balls)) spp=sampling.local_spp;
-        else if(sampling.background_spp) {
+        if(sampling.local_spp && near_ball_pixel(point,*balls)) {
+            spp=sampling.local_spp;
+            sobol=sampling.local_sobol;
+        } else if(sampling.background_spp) {
             // The inset covers the complete jittered pixel and thin lens.
             const float guard=rail_width+.010f+.5f*footprint;
             if(fabsf(point.x)>table_nose_x+guard || fabsf(point.z)>table_nose_z+guard)
@@ -161,8 +165,8 @@ RENDER_HD inline RGB8 render_pixel(int x,int y,int w,int h,int stage,int spp,con
         const u32 seed = mix_bits(first + static_cast<u32>(s));
         const unsigned pose = (static_cast<std::uint64_t>(mix_bits(seed ^ 0xba7c19u)) * poses) >> 32;
         Rng rng={hash32((seed?seed:base_seed)^path_key)};
-        const Ray ray=camera(x,y,w,h,stage,rng);
-        const FirstLight light={sampling.random_light?~0u:static_cast<u32>(s),light_key};
+        const FirstSample light={sampling.random_light?~0u:static_cast<u32>(s),light_key,sobol};
+        const Ray ray=camera(x,y,w,h,stage,rng,light);
         const Vec v=trace(ray,balls[pose],stage,0.f,rng,analytic_shadow,cached,footprint,light);
         r += v.x; g += v.y; b += v.z;
     }
@@ -189,7 +193,7 @@ __global__ void sample_felt_anchors(Vec* values,int nx,int ny,int w,int h,int sp
     Vec sum{};
     for(int s=0;s<spp;++s) {
         Rng rng={mix_bits(key+static_cast<u32>(s))};
-        const FirstLight light={random_light?~0u:static_cast<u32>(s),mix_bits(key^0x9e764389u)};
+        const FirstSample light={random_light?~0u:static_cast<u32>(s),mix_bits(key^0x9e764389u)};
         sum=sum+trace_felt_pass<FeltPass::Basis>(ray,*balls,2,0.f,rng,false,-1.f,{},0.f,light);
     }
     const Vec v=sum*(1.f/spp);
@@ -218,7 +222,7 @@ __device__ inline RGB8 render_felt_pixel(int x,int y,int w,int h,int spp,const B
         const u32 seed=mix_bits(first+static_cast<u32>(s));
         Rng rng={hash32((seed?seed:base_seed)^path_key)};
         const Ray ray=camera(x,y,w,h,2,rng);
-        const FirstLight light={random_light?~0u:static_cast<u32>(s),light_key};
+        const FirstSample light={random_light?~0u:static_cast<u32>(s),light_key};
         sum=sum+trace_felt_pass<FeltPass::Residual>(ray,balls,2,0.f,rng,false,-1.f,irradiance,0.f,light);
     }
     const float inv=1.f/spp;
@@ -354,6 +358,11 @@ int main(int argc, char** argv) try {
         sampling.background_spp=integer(s,1,spp,"background spp");
     }
     if(const char* s=std::getenv("ACG_RANDOM_LIGHT")) sampling.random_light=integer(s,0,1,"random first light")!=0;
+    if(const char* s=std::getenv("ACG_LOCAL_SOBOL")) sampling.local_sobol=integer(s,0,1,"local Sobol")!=0;
+    if(sampling.local_sobol && !sampling.local_spp)
+        throw std::runtime_error("ACG_LOCAL_SOBOL requires ACG_LOCAL_SPP");
+    if(sampling.random_light && sampling.local_sobol)
+        throw std::runtime_error("ACG_LOCAL_SOBOL and ACG_RANDOM_LIGHT are mutually exclusive");
     if(sampling.local_spp && (stage!=2 || poses!=1))
         throw std::runtime_error("The ball-neighborhood sampler requires single-pose stage 2");
     const char* felt_setting=std::getenv("ACG_FELT_CACHE");

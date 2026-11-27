@@ -9,6 +9,41 @@ int main() {
     constexpr int samples=20000;
     const Vec p={0,0,0};
     {
+        // Every 16x16 subpixel cell in the first two Sobol dimensions is hit
+        // once in a 256-sample prefix, even after a pixel-dependent shift.
+        bool cells[256]={};
+        for(unsigned i=0;i<256;++i) {
+            const FirstSample s={i,571963u,true};
+            const int x=int(16*primary_sobol(s,RasterX)), y=int(16*primary_sobol(s,RasterY));
+            if(x<0 || x>=16 || y<0 || y>=16 || cells[y*16+x]) {
+                std::fputs("The joint raster sequence lost its 16x16 coverage.\n",stderr);
+                return 1;
+            }
+            cells[y*16+x]=true;
+        }
+    }
+    {
+        // The projected diffuse direction has uniform azimuth and radius^2.
+        // Keep the backing RNG fixed to exercise the Sobol continuation.
+        const Vec n={0,1,0};
+        int sectors[16]={};
+        for(unsigned i=0;i<256;++i) {
+            Rng rng={812983u};
+            const Vec wi=sample_direction(n,n,.6f,0,rng,{i,1920143u,true});
+            const int radial=int(lo(3.f,4*(wi.x*wi.x+wi.z*wi.z)));
+            const int quadrant=(wi.x<0?1:0)+(wi.z<0?2:0);
+            if(wi.y<0 || fabsf(dot(wi,wi)-1)>1.e-5f) {
+                std::fputs("Sobol continuation left the cosine hemisphere.\n",stderr);
+                return 1;
+            }
+            ++sectors[4*radial+quadrant];
+        }
+        for(int count:sectors) if(count<8 || count>24) {
+            std::fputs("Sobol continuation did not stratify the projected diffuse directions.\n",stderr);
+            return 1;
+        }
+    }
+    {
         double sharp=0,filtered=0;
         for(int i=0;i<1024;++i) {
             const float phase=(i+.5f)*pi/1024;
@@ -37,15 +72,17 @@ int main() {
             return 1;
         }
         const auto view=prepare_brdf_view(m,n,n);
-        Vec ray_sum{},interval_sum{},iid_sum{};
+        Vec ray_sum{},interval_sum{},iid_sum{},sobol_sum{};
         constexpr unsigned count=8192;
         for(unsigned i=0;i<count;++i) {
-            Rng a={hash32(i+3127819u)},b=a,c=a;
+            Rng a={hash32(i+3127819u)},b=a,c=a,d=a;
             ray_sum=ray_sum+lighting(receiver,n,n,m,view,balls,2,a,hit,false,-1.f,false,{i,584013u});
             interval_sum=interval_sum+lighting(receiver,n,n,m,view,balls,2,b,hit,true,-1.f,false,{i,584013u});
             iid_sum=iid_sum+lighting(receiver,n,n,m,view,balls,2,c,hit,false,-1.f,false);
+            sobol_sum=sobol_sum+lighting(receiver,n,n,m,view,balls,2,d,hit,false,-1.f,false,{i,584013u,true});
         }
-        if(fabsf(ray_sum.y-interval_sum.y)>count*.0025f || fabsf(ray_sum.y-iid_sum.y)>count*.0035f) {
+        if(fabsf(ray_sum.y-interval_sum.y)>count*.0025f || fabsf(ray_sum.y-iid_sum.y)>count*.0035f ||
+           fabsf(ray_sum.y-sobol_sum.y)>count*.0025f) {
             std::fputs("The first-hit sequence or interval estimator biased a ball penumbra.\n",stderr);
             return 1;
         }
@@ -473,21 +510,23 @@ int main() {
             // proposal cancels the direct/light-hit partition samplewise;
             // deeper roulette may pick different survivors for each split.
             constexpr int n=8192;
-            double sum[3]={},squares[3]={};
-            for(int i=0;i<n;++i) {
-                Rng a={hash32(i+32957u)},b=a,c=a;
-                const FirstLight first={static_cast<uint32_t>(i),4928531u};
-                const Vec f=trace(ray,balls,2,0,a,false,-1.f,0.f,first);
-                const Vec basis=trace_felt_pass<FeltPass::Basis>(ray,balls,2,0,b,false,-1.f,{},0.f,first);
-                const Vec rebuilt=trace_felt_pass<FeltPass::Residual>(ray,balls,2,0,c,false,-1.f,basis,0.f,first);
-                const Vec error=rebuilt-f;
-                for(int j=0;j<3;++j) {
-                    const double v=axis(error,j); sum[j]+=v; squares[j]+=v*v;
+            for(bool sobol:{false,true}) {
+                double sum[3]={},squares[3]={};
+                for(int i=0;i<n;++i) {
+                    Rng a={hash32(i+32957u)},b=a,c=a;
+                    const FirstSample first={static_cast<uint32_t>(i),4928531u,sobol};
+                    const Vec f=trace(ray,balls,2,0,a,false,-1.f,0.f,first);
+                    const Vec basis=trace_felt_pass<FeltPass::Basis>(ray,balls,2,0,b,false,-1.f,{},0.f,first);
+                    const Vec rebuilt=trace_felt_pass<FeltPass::Residual>(ray,balls,2,0,c,false,-1.f,basis,0.f,first);
+                    const Vec error=rebuilt-f;
+                    for(int j=0;j<3;++j) {
+                        const double v=axis(error,j); sum[j]+=v; squares[j]+=v*v;
+                    }
                 }
-            }
-            for(int j=0;j<3;++j) if(fabs(sum[j]/n)>5*sqrt(squares[j])/n+2.e-5) {
-                std::fputs("Felt basis plus residual changed the colocated radiance mean.\n",stderr);
-                return 1;
+                for(int j=0;j<3;++j) if(fabs(sum[j]/n)>5*sqrt(squares[j])/n+2.e-5) {
+                    std::fputs("Felt basis plus residual changed the colocated radiance mean.\n",stderr);
+                    return 1;
+                }
             }
         }
     }

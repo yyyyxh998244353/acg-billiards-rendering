@@ -45,6 +45,8 @@ ffmpeg -framerate 30 -i outputs/break-1080p/frame-%04d.ppm \
 
 新版轨盖和袋衬参考实物装配；轨口内的包布、石板台阶和袋衬各有真实求交面。复现新版成片时可在上一条配置中加 `ACG_BACKGROUND_SPP=24`，只降低带安全边距的桌外像素预算。
 
+球周仍为 144 spp；在上述成片配置加 `ACG_LOCAL_SOBOL=1`，仅在球周联合分层像素、面灯和首跳方向，不增加路径数。
+
 ## 代码从哪里读
 
 - [`physics.py`](physics.py)：可重复的开球模拟，输出各帧的球心坐标。

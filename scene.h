@@ -3,6 +3,9 @@
 
 #include <math.h>
 #include <stdint.h>
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 #if defined(__aarch64__) && defined(__ARM_NEON) && !defined(__CUDACC__) && !defined(__CUDA__)
 #include <arm_neon.h>
 #include <array>
@@ -61,6 +64,8 @@ struct Rng {
         return float(((b>>22u)^b)>>8u)*0x1p-24f;
     }
 };
+
+#include "primary_sampling.h"
 
 struct Ray { Vec o,d; };
 struct Box { Vec a,b; };
@@ -1307,8 +1312,11 @@ ACG_HD inline Vec brdf(Material m,Vec n,Vec wo,Vec wi,const BrdfView& view,float
     return (grey(1)-F)*m.diffuse*(1/pi)+F*(D*g*smith_g1(b,a2)/(4*a*b));
 }
 
-ACG_HD inline Vec sample_direction(Vec n,Vec wo,float rough,float specular_probability,Rng &rng) {
+ACG_HD inline Vec sample_direction(Vec n,Vec wo,float rough,float specular_probability,Rng &rng,FirstSample first={}) {
     Frame f=frame(n); float choice=rng.next(),u=rng.next(),v=rng.next();
+    if(first.sobol) {
+        choice=primary_sobol(first,Lobe); u=primary_sobol(first,DirectionU); v=primary_sobol(first,DirectionV);
+    }
     float rad=sqrtf(u),ang=2*pi*v,dx=rad*cosf(ang),dy=rad*sinf(ang);
     if(choice>=specular_probability) return world(f,{dx,dy,sqrtf(1-u)});
     float a=rough*rough; Vec view=local(f,wo),vh=unit({a*view.x,a*view.y,view.z});
@@ -1419,11 +1427,8 @@ bool analytic_area_sample(Vec p,Vec n,Vec wo,Vec q,Material m,const BrdfView& vi
     result=emission()*sum*(2*light_hz/area_samples);
     return true;
 }
-struct FirstLight {
-    uint32_t sample=~0u,key=0;
-};
 
-ACG_HD inline Vec first_light_r2(FirstLight first) {
+ACG_HD inline Vec first_light_r2(FirstSample first) {
     // Shift the R2 sequence independently per pixel in integer coordinates.
     // Unlike s/spp strata, prefixes remain nested when the budget changes.
     const uint32_t u=hash32(first.key^0xa4aba1c3u)+0xc13fa9a9u*first.sample;
@@ -1433,7 +1438,7 @@ ACG_HD inline Vec first_light_r2(FirstLight first) {
 
 template<FeltPass Pass=FeltPass::Full>
 ACG_HD inline Vec lighting(Vec p,Vec n,Vec wo,Material m,const BrdfView& view,const Balls &balls,int stage,
-                           Rng &rng,const Hit& hit,bool analytic,float cached,bool compete,FirstLight first={}) {
+                           Rng &rng,const Hit& hit,bool analytic,float cached,bool compete,FirstSample first={}) {
     // Stage 2 uses a large key over the table and a weak fill. Stage 0/1
     // retain the unmodified point-light diagnostic.
     Vec I=stage==2?Vec{.36f,.326f,.304f}:Vec{8.05f,7.35f,6.37f};
@@ -1444,7 +1449,8 @@ ACG_HD inline Vec lighting(Vec p,Vec n,Vec wo,Material m,const BrdfView& view,co
     if(stage==2 && p.y<light_y) {
         const bool eligible=Pass==FeltPass::Full && analytic && soft_eligible(stage,hit,p,n,balls.c);
         const bool r2=first.sample!=~0u;
-        const Vec stratum=r2?first_light_r2(first):Vec{};
+        const Vec stratum=first.sobol?Vec{primary_sobol(first,EmitterX),0,primary_sobol(first,EmitterZ)}:
+            (r2?first_light_r2(first):Vec{});
 #ifdef ACG_STRATIFY_LIGHT_2D
         // Randomly pair the X and Z strata; a fixed diagonal would leave half
         // of the emitter unsampled. The marginal light PDF is unchanged.
@@ -1487,7 +1493,7 @@ ACG_HD inline bool glass_bounce(Vec d,Vec n,bool entering,Rng &rng,Vec &dir,floa
 template<FeltPass Pass>
 ACG_HD inline Vec trace_felt_pass(Ray ray,const Balls &balls,int stage,float t,Rng &rng,
                                   bool analytic=false,float cached=-1,Vec irradiance={},float pixel_width=0,
-                                  FirstLight first={}) {
+                                  FirstSample first={}) {
     Vec out={},beta=grey(1),prev={}; float prev_pdf=0,eta_scale=1; bool delta=true,inside=false;
 #ifndef ACG_MAX_HITS
 #define ACG_MAX_HITS 14
@@ -1538,11 +1544,12 @@ ACG_HD inline Vec trace_felt_pass(Ray ray,const Balls &balls,int stage,float t,R
                 out=out+lighting<Pass>(p,n,wo,m,view,balls,stage,rng,hit,false,-1.f,continue_path,first);
             else
                 out=out+beta*lighting(p,n,wo,m,view,balls,stage,rng,hit,analytic,vis,continue_path,
-                                      depth==0?first:FirstLight{});
+                                      depth==0?first:FirstSample{});
             if constexpr (Pass==FeltPass::Residual)
                 if(felt) out=out+irradiance*felt_diffuse_basis(m);
             if(!continue_path) break;
-            wi=sample_direction(n,wo,m.rough,view.specular_probability,rng); float c=dot(wi,n);
+            wi=sample_direction(n,wo,m.rough,view.specular_probability,rng,depth==0?first:FirstSample{});
+            const float c=dot(wi,n);
             if(c<=0) break;
             Vec f=brdf(m,n,wo,wi,view,prev_pdf); if(prev_pdf<=0) break;
             // Keep the same sampling PDF and both sides of the emitter MIS
@@ -1558,7 +1565,7 @@ ACG_HD inline Vec trace_felt_pass(Ray ray,const Balls &balls,int stage,float t,R
     return out;
 }
 ACG_HD inline Vec trace(Ray ray,const Balls &balls,int stage,float t,Rng &rng,bool analytic=false,float cached=-1,
-                       float pixel_width=0,FirstLight first={}) {
+                       float pixel_width=0,FirstSample first={}) {
     return trace_felt_pass<FeltPass::Full>(ray,balls,stage,t,rng,analytic,cached,{},pixel_width,first);
 }
 ACG_HD constexpr float camera_half_height(float aspect) { return hi(.865f,1.54f/aspect); }
@@ -1569,9 +1576,10 @@ ACG_HD constexpr float camera_pixel_width(int w,int h) {
 ACG_HD constexpr Vec camera_plane(float x,float y,int w,int h,float pitch) {
     return {(x-.5f*w)*pitch,0,(y-.5f*h)*pitch};
 }
-ACG_HD inline Ray camera(int x,int y,int w,int h,int stage,Rng &rng) {
+ACG_HD inline Ray camera(int x,int y,int w,int h,int stage,Rng &rng,FirstSample first={}) {
     const float pitch=camera_pixel_width(w,h);
     float jx=rng.next(), jy=rng.next();
+    if(first.sobol) { jx=primary_sobol(first,RasterX); jy=primary_sobol(first,RasterY); }
 #ifdef ACG_NO_AA
     jx=jy=.5f;
 #endif
