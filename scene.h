@@ -975,10 +975,18 @@ ACG_HD inline Vec pigment(int n) {
         default:return {.37f,.040f,.054f};
     }
 }
-ACG_HD inline float grain(Vec p) {
+// Roll off periodic detail before its phase spans a full pixel cycle.
+ACG_HD constexpr float texture_band(float phase_halfwidth) {
+    const float t=clamp((pi-phase_halfwidth)*(1.5f/pi),0,1);
+    return t*t*(3-2*t);
+}
+
+ACG_HD inline float grain(Vec p,float footprint=0) {
     float bend=2.8f*sinf(7.1f*p.x+2.9f*p.z)+1.5f*sinf(17.3f*p.x+7*p.y);
-    float rings=sinf(96*p.z+59*p.y+bend);
-    return clamp(.53f+.27f*rings+.12f*sinf(239*p.z+123*p.y+2.3f*bend)+.06f*sinf(611*p.z+2*bend),0,1);
+    const float rings=.27f*texture_band(150*footprint)*sinf(96*p.z+59*p.y+bend);
+    const float lines=.12f*texture_band(330*footprint)*sinf(239*p.z+123*p.y+2.3f*bend);
+    const float pores=.06f*texture_band(660*footprint)*sinf(611*p.z+2*bend);
+    return clamp(.53f+rings+lines+pores,0,1);
 }
 
 ACG_HD inline float cloth_finish(float along,float across) {
@@ -1010,6 +1018,25 @@ ACG_HD inline bool digit(int n,float u,float v) {
     int x=int(floorf(u)),y=int(floorf(v));
     return x>=0 && x<3 && y>=0 && y<5 && ((glyph(n)>>(14-3*y-x))&1u);
 }
+ACG_HD inline float digit_area(int n,float u,float v,float du,float dv) {
+    if(du<=1.e-6f || dv<=1.e-6f) return float(digit(n,u,v));
+    const float x0=u-du,x1=u+du,y0=v-dv,y1=v+dv;
+    const int left=int(hi(0,floorf(x0))),right=int(lo(2,floorf(x1)));
+    const int top=int(hi(0,floorf(y0))),bottom=int(lo(4,floorf(y1)));
+    const unsigned bits=glyph(n);
+    float covered=0;
+    for(int y=top;y<=bottom;++y) {
+        const float height=lo(y1,float(y+1))-hi(y0,float(y));
+        for(int x=left;x<=right;++x)
+            if((bits>>(14-3*y-x))&1u)
+                covered+=height*(lo(x1,float(x+1))-hi(x0,float(x)));
+    }
+    return clamp(covered/(4*du*dv),0,1);
+}
+ACG_HD constexpr float texture_coverage(float signed_distance,float halfwidth) {
+    if(halfwidth<=0) return signed_distance>0?1.f:0.f;
+    return clamp(.5f+.5f*signed_distance/halfwidth,0,1);
+}
 ACG_HD inline Vec unroll(Vec v,Vec delta) {
     float dist=sqrtf(delta.x*delta.x+delta.z*delta.z);
     return dist<eps?v:rotate(v,{delta.z/dist,0,-delta.x/dist},-dist/radius);
@@ -1028,28 +1055,35 @@ ACG_HD inline Vec ball_local(Vec n,int slot,Vec center,float t) {
     n=rotate(n,{0,1,0},-.38f+.41f*sinf(3.7f*slot));
     return rotate(n,{1,0,0},.61f+.13f*sinf(1.91f*slot));
 }
-ACG_HD inline Vec enamel(int num,Vec n,Vec body) {
+ACG_HD inline Vec enamel(int num,Vec n,Vec body,float footprint=0) {
     if(num==0) {
-        return hi(fabsf(n.x),hi(fabsf(n.y),fabsf(n.z)))>.994f?Vec{.48f,.046f,.041f}:body;
+        const float dominant=hi(fabsf(n.x),hi(fabsf(n.y),fabsf(n.z)));
+        return mix(body,{.48f,.046f,.041f},texture_coverage(dominant-.994f,.11f*footprint));
     }
     // Longitude/latitude charts give two antipodal number badges and the belt.
     float lon=atan2f(n.x,n.z),lat=asinf(clamp(n.y,-1,1));
     if(lon>pi*.5f) lon-=pi; if(lon<-pi*.5f) lon+=pi;
     Vec ivory={.90f,.835f,.686f};
-    Vec c=num>8 && fabsf(lat)>.49f?ivory:body;
-    float rr=lon*lon+lat*lat;
-    if(rr<.45f*.45f) {
-        c=rr>.412f*.412f?mix(body,grey(.025f),.48f):ivory;
-        float u=lon/.092f,v=2.5f-lat/.095f;
-        bool ink=num<10?digit(num,u+1.5f,v):(digit(1,u+3.35f,v)||digit(num%10,u-.35f,v));
-        if(ink) c={.013f,.017f,.022f};
+    Vec c=num>8?mix(body,ivory,texture_coverage(fabsf(lat)-.49f,footprint)):body;
+    const float arc=footprint/hi(.25f,sqrtf(hi(0,1-n.y*n.y)));
+    const float edge=.45f+arc,rr=lon*lon+lat*lat;
+    if(rr<edge*edge) {
+        const float r=sqrtf(rr);
+        const float outer=texture_coverage(.45f-r,arc),inner=texture_coverage(.412f-r,arc);
+        // Weighted disjoint badge regions: the thin rim is the difference
+        // of the two disk coverages, not another binary texture layer.
+        const float u=lon/.092f,v=2.5f-lat/.095f,du=arc/.092f,dv=footprint/.095f;
+        const float ink=num<10?digit_area(num,u+1.5f,v,du,dv):
+            digit_area(1,u+3.35f,v,du,dv)+digit_area(num%10,u-.35f,v,du,dv);
+        const Vec badge=mix(ivory,{.013f,.017f,.022f},clamp(ink,0,1));
+        c=c*(1-outer)+mix(body,grey(.025f),.48f)*(outer-inner)+badge*inner;
     }
     return c;
 }
 
 struct Material { Vec diffuse,f0; float rough; };
 ACG_HD inline Material varnish(Vec c,float rough) { return {c,grey(.044f),rough}; }
-ACG_HD inline Material material(Hit h,Vec p,const Balls &balls,float t,int stage) {
+ACG_HD inline Material material(Hit h,Vec p,const Balls &balls,float t,int stage,float footprint=0) {
     if(stage==0) {
         Vec c;
         switch(h.mat) {
@@ -1069,25 +1103,32 @@ ACG_HD inline Material material(Hit h,Vec p,const Balls &balls,float t,int stage
             }
             Vec base=pigment(num); float rough=.15f;
             if(num==5) { // Marquetry, with a clear dielectric finish (not a metal).
-                base=mix({.112f,.031f,.012f},{.64f,.301f,.088f},grain(n*.53f)); rough=.205f;
+                base=mix({.112f,.031f,.012f},{.64f,.301f,.088f},grain(n*.53f,footprint*.53f)); rough=.205f;
             }
             if(num==4) { // Veined marble, evaluated in ball-local coordinates.
                 float bend=.21f*sinf(8*n.z)+.09f*sinf(19*n.x+11*n.z);
                 float vein=1-fabsf(sinf(13*(n.y+bend)));
                 vein*=vein; vein*=vein; vein*=vein;
+                vein=.18f+(vein-.18f)*texture_band(68*footprint);
                 base=mix({.76f,.73f,.66f},{.14f,.18f,.23f},vein); rough=.23f;
             } else if(num==6) { // Layered ceramic glaze with mottled pigment.
                 float mottling=.5f+.5f*sinf(17*n.x+3*sinf(13*n.z))*sinf(19*n.y);
                 base=mix({.016f,.085f,.19f},{.16f,.58f,.66f},mottling); rough=.18f;
-            } else if(num==7) { // Basket weave with alternating over-under threads.
-                float a=atan2f(n.x,n.z)*(12/pi), b=asinf(clamp(n.y,-1,1))*(12/pi);
-                float warp=1-fabsf(2*fract(a)-1), weft=1-fabsf(2*fract(b)-1);
-                bool over=fract((floorf(a)+floorf(b))*.5f)<.25f;
-                base=over?mix({.083f,.029f,.017f},{.58f,.28f,.15f},warp)
-                         :mix({.064f,.037f,.021f},{.38f,.24f,.11f},weft);
+            } else if(num==7) { // Keep weave only where the projected thread pitch resolves.
+                constexpr Vec average={.277f,.147f,.0745f};
+                const float band=texture_band(48*footprint/hi(.18f,sqrtf(hi(0,1-n.y*n.y))));
+                base=average;
+                if(band>0) {
+                    const float a=atan2f(n.x,n.z)*(12/pi),b=asinf(clamp(n.y,-1,1))*(12/pi);
+                    const float warp=1-fabsf(2*fract(a)-1),weft=1-fabsf(2*fract(b)-1);
+                    const bool over=fract((floorf(a)+floorf(b))*.5f)<.25f;
+                    const Vec woven=over?mix({.083f,.029f,.017f},{.58f,.28f,.15f},warp)
+                                        :mix({.064f,.037f,.021f},{.38f,.24f,.11f},weft);
+                    base=mix(average,woven,band);
+                }
                 rough=.46f;
             }
-            return varnish(enamel(num,n,base),rough);
+            return varnish(enamel(num,n,base,footprint),rough);
         }
         case Felt: {
             const float tone=cloth_finish(p.x,p.z);
@@ -1364,7 +1405,7 @@ ACG_HD inline bool glass_bounce(Vec d,Vec n,bool entering,Rng &rng,Vec &dir,floa
 }
 template<FeltPass Pass>
 ACG_HD inline Vec trace_felt_pass(Ray ray,const Balls &balls,int stage,float t,Rng &rng,
-                                  bool analytic=false,float cached=-1,Vec irradiance={}) {
+                                  bool analytic=false,float cached=-1,Vec irradiance={},float pixel_width=0) {
     Vec out={},beta=grey(1),prev={}; float prev_pdf=0,eta_scale=1; bool delta=true,inside=false;
 #ifndef ACG_MAX_HITS
 #define ACG_MAX_HITS 14
@@ -1405,7 +1446,9 @@ ACG_HD inline Vec trace_felt_pass(Ray ray,const Balls &balls,int stage,float t,R
 #endif
             delta=true;
         } else {
-            Material m=material(hit,p,balls,t,stage);
+            const float footprint=depth==0 && hit.mat==Ball?
+                lo(.30f,(.5f*pixel_width/radius)/hi(.14f,dot(n,wo))):0.f;
+            Material m=material(hit,p,balls,t,stage,footprint);
             const float vis=depth==0 && hit.mat==Felt && n.y==1 && fabsf(p.y)<eps?cached:-1.f;
             const bool continue_path=stage!=0 && depth+1<max_hits;
             const BrdfView view=prepare_brdf_view(m,n,wo);
@@ -1431,8 +1474,12 @@ ACG_HD inline Vec trace_felt_pass(Ray ray,const Balls &balls,int stage,float t,R
     }
     return out;
 }
-ACG_HD inline Vec trace(Ray ray,const Balls &balls,int stage,float t,Rng &rng,bool analytic=false,float cached=-1) {
-    return trace_felt_pass<FeltPass::Full>(ray,balls,stage,t,rng,analytic,cached);
+ACG_HD inline Vec trace(Ray ray,const Balls &balls,int stage,float t,Rng &rng,bool analytic=false,float cached=-1,
+                       float pixel_width=0) {
+    return trace_felt_pass<FeltPass::Full>(ray,balls,stage,t,rng,analytic,cached,{},pixel_width);
+}
+ACG_HD inline float camera_pixel_width(int w,int h) {
+    return 2*hi(.77f,1.40f/(float(w)/h))/h;
 }
 ACG_HD inline Ray camera(int x,int y,int w,int h,int stage,Rng &rng) {
     const float aspect=float(w)/float(h),halfheight=hi(.77f,1.40f/aspect);
@@ -1469,6 +1516,6 @@ ACG_HD inline Vec sample_pixel(int x,int y,int w,int h,int stage,unsigned seed,f
     float t=balls?0.f:(stage==0?time:time+(rng.next()-.5f)*(1.f/48));
     Balls poses; place_balls(poses,t,balls);
     poses.tree=tree;
-    Ray r=camera(x,y,w,h,stage,rng); return trace(r,poses,stage,t,rng,analytic,cached);
+    Ray r=camera(x,y,w,h,stage,rng); return trace(r,poses,stage,t,rng,analytic,cached,camera_pixel_width(w,h));
 }
 #endif

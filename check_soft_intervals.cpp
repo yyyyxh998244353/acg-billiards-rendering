@@ -9,6 +9,27 @@ int main() {
     constexpr int samples=20000;
     const Vec p={0,0,0};
     {
+        // At a subpixel digit edge, coverage must match the average of the
+        // original bitmap, while the unfiltered digit toggles from 0 to 1.
+        constexpr float u=.91f,v=.91f,du=.1875f,dv=.21875f;
+        int ink=0;
+        constexpr int side=128;
+        for(int y=0;y<side;++y) for(int x=0;x<side;++x)
+            ink+=digit(7,u+(2*(x+.5f)/side-1)*du,v+(2*(y+.5f)/side-1)*dv);
+        const float coverage=digit_area(7,u,v,du,dv);
+        if(fabsf(coverage-float(ink)/(side*side))>.009f || !(coverage>0 && coverage<1)) {
+            std::fputs("Filtered glyph lost its subpixel ink coverage.\n",stderr);
+            return 1;
+        }
+        const Vec n={sinf(.432f),0,cosf(.432f)},body={.28f,.05f,.03f};
+        const Vec rim=enamel(3,n,body),filtered=enamel(3,n,body,.035f);
+        if(!(filtered.x>rim.x+.03f && filtered.x<.60f) ||
+           fabsf(grain({0,0,.33f},.15f)-.53f)>1.e-6f) {
+            std::fputs("Filtered badges or wood grain retained an unresolved hard pattern.\n",stderr);
+            return 1;
+        }
+    }
+    {
         // Center ray intersects a sphere lying halfway to the emitter; a
         // narrow slice lies entirely inside its projected silhouette.
         SoftEmitter lamp={1,0,.01f,.01f};

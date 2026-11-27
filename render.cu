@@ -126,13 +126,14 @@ RENDER_HD inline RGB8 render_pixel(int x,int y,int w,int h,int stage,int spp,con
     const auto column = static_cast<u32>(x);
     const u32 first = mix_bits(row.sample_key ^ column);
     const u32 path_key = row.path_key ^ hash32(column + 0x9e3779b9u);
+    const float footprint=camera_pixel_width(w,h);
     float r = 0, g = 0, b = 0;
     for (int s = 0; s < spp; ++s) {
         const u32 seed = mix_bits(first + static_cast<u32>(s));
         const unsigned pose = (static_cast<std::uint64_t>(mix_bits(seed ^ 0xba7c19u)) * poses) >> 32;
         Rng rng={hash32((seed?seed:base_seed)^path_key)};
         const Ray ray=camera(x,y,w,h,stage,rng);
-        const Vec v=trace(ray,balls[pose],stage,0.f,rng,analytic_shadow,cached);
+        const Vec v=trace(ray,balls[pose],stage,0.f,rng,analytic_shadow,cached,footprint);
         r += v.x; g += v.y; b += v.z;
     }
     const float inv = 1.0f / spp;
