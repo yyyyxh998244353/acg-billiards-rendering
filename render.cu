@@ -61,14 +61,13 @@ RENDER_HD inline RowSeed row_seed(int y,u32 sample_seed) {
 }
 
 struct Sampling {
-    int local_spp=0;
+    int local_spp=0,background_spp=0;
     bool random_light=false;
 };
 constexpr float ball_detail_radius=.080f;
 
-RENDER_HD inline bool near_ball_pixel(int x,int y,int w,int h,float pitch,const Balls& balls) {
-    using namespace acg_scene_detail;
-    const float dx=(x+.5f-w*.5f)*pitch,dz=(y+.5f-h*.5f)*pitch;
+RENDER_HD inline bool near_ball_pixel(Vec point,const Balls& balls) {
+    const float dx=point.x,dz=point.z;
     if(dx<balls.box.a.x-ball_detail_radius || dx>balls.box.b.x+ball_detail_radius ||
        dz<balls.box.a.z-ball_detail_radius || dz>balls.box.b.z+ball_detail_radius) return false;
     for(Vec c:balls.c) {
@@ -146,7 +145,16 @@ RENDER_HD inline RGB8 render_pixel(int x,int y,int w,int h,int stage,int spp,con
     const u32 first = mix_bits(row.sample_key ^ column);
     const u32 path_key = row.path_key ^ hash32(column + 0x9e3779b9u);
     const float footprint=camera_pixel_width(w,h);
-    if(sampling.local_spp && near_ball_pixel(x,y,w,h,footprint,*balls)) spp=sampling.local_spp;
+    if(sampling.local_spp || sampling.background_spp) {
+        const Vec point=camera_plane(x+.5f,y+.5f,w,h,footprint);
+        if(sampling.local_spp && near_ball_pixel(point,*balls)) spp=sampling.local_spp;
+        else if(sampling.background_spp) {
+            // The inset covers the complete jittered pixel and thin lens.
+            const float guard=rail_width+.010f+.5f*footprint;
+            if(fabsf(point.x)>table_nose_x+guard || fabsf(point.z)>table_nose_z+guard)
+                spp=sampling.background_spp;
+        }
+    }
     const u32 light_key=mix_bits(first^0x9e764389u);
     float r = 0, g = 0, b = 0;
     for (int s = 0; s < spp; ++s) {
@@ -341,6 +349,10 @@ int main(int argc, char** argv) try {
     const unsigned poses=sequence_mode?1:argc-7;
     Sampling sampling;
     if(const char* s=std::getenv("ACG_LOCAL_SPP")) sampling.local_spp=integer(s,spp,imax,"ball-neighborhood spp");
+    if(const char* s=std::getenv("ACG_BACKGROUND_SPP")) {
+        if(stage!=2) throw std::runtime_error("ACG_BACKGROUND_SPP requires stage 2");
+        sampling.background_spp=integer(s,1,spp,"background spp");
+    }
     if(const char* s=std::getenv("ACG_RANDOM_LIGHT")) sampling.random_light=integer(s,0,1,"random first light")!=0;
     if(sampling.local_spp && (stage!=2 || poses!=1))
         throw std::runtime_error("The ball-neighborhood sampler requires single-pose stage 2");
@@ -433,11 +445,11 @@ int main(int argc, char** argv) try {
         Settings config;
         config.spacing=integer(setting,1,64,"interpolation grid spacing");
         cache.assign(count,-1.f);
-        const float aspect=float(w)/h, half_height=hi(.77f,1.40f/aspect);
+        const float pitch=camera_pixel_width(w,h);
         const Vec guide_inverse=invdir(guide_direction);
         const Box contact_bounds={state.box.a-grey(contact_distance),state.box.b+grey(contact_distance)};
         auto guide=[&](int x,int y) noexcept {
-            const Vec point={(2*(x+.5f)/w-1)*aspect*half_height,0,(2*(y+.5f)/h-1)*half_height};
+            const Vec point=camera_plane(x+.5f,y+.5f,w,h,pitch);
             return probe_receiver(point,state,contact_bounds,guide_inverse,stage);
         };
         auto exact=[&](int,int,const Receiver& g) noexcept {

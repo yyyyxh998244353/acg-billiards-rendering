@@ -1,4 +1,4 @@
-"""Overlay sampled ball-center paths on the orthographic open-break render."""
+"""Overlay ball-center paths on ortho-cpu.png rendered with this revision's camera."""
 from pathlib import Path
 from PIL import Image, ImageDraw
 
@@ -13,7 +13,7 @@ with Image.open(out / 'ortho-cpu.png') as pair:
     after = pair.crop((0, h, w, total))
     before.save(out / 'overhead-before.png')
     after.save(out / 'overhead-after.png')
-scale = h / (2 * max(.77, 1.40 / (w / h)))
+scale = h / (2 * max(.865, 1.54 / (w / h)))  # Mirrors scene.h's camera_half_height.
 canvas = after.resize((w * 2, h * 2)).convert('RGBA')
 ink = Image.new('RGBA', canvas.size)
 draw = ImageDraw.Draw(ink)

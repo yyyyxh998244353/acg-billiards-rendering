@@ -1,4 +1,4 @@
-"""Run reproducible renderer ablations; never submits Slurm jobs."""
+"""Compare binaries built for the same scene and camera projection; never submits Slurm jobs."""
 import argparse
 import csv
 import math
@@ -16,7 +16,8 @@ def run(binary, mode, spacing, spp, args, folder):
         for j, i in enumerate(args.frames)), encoding='utf-8')
     env = {k: v for k, v in os.environ.items()
            if k not in {'ACG_INTERPOLATE', 'ACG_TIMING_ONLY', 'ACG_BVH', 'ACG_SAMPLE_SEED',
-                        'ACG_FELT_CACHE', 'ACG_FELT_LOCAL_SPP', 'ACG_LOCAL_SPP', 'ACG_RANDOM_LIGHT'}}
+                        'ACG_FELT_CACHE', 'ACG_FELT_LOCAL_SPP', 'ACG_LOCAL_SPP',
+                        'ACG_BACKGROUND_SPP', 'ACG_RANDOM_LIGHT'}}
     env['ACG_BVH'] = mode
     env['ACG_SAMPLE_SEED'] = str(args.reference_seed if folder.name == 'reference' else args.seed)
     if spacing:
@@ -47,7 +48,7 @@ def load_ppm(path):
 
 def ball_roi(args, frame):
     w, h = args.width, args.height
-    scale = h / (2*max(.77, 1.40/(w/h)))
+    scale = h / (2*max(.865, 1.54/(w/h)))  # Mirrors scene.h's camera_half_height.
     coords = list(map(float, (args.snapshots / f'frame_{frame:06d}.txt').read_text().split()))
     pixels = set()
     radius = .11*scale

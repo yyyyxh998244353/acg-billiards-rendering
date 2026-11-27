@@ -43,6 +43,8 @@ ffmpeg -framerate 30 -i outputs/break-1080p/frame-%04d.ppm \
 
 在新版灯光下复现**球周优先版**，改用 `--spp 72`，渲染阶段设置 `ACG_FELT_CACHE=320 ACG_FELT_LOCAL_SPP=20 ACG_LOCAL_SPP=144`。额外样本只分配给球周，默认首交面灯使用低差异序列。
 
+新版轨盖和袋衬参考实物装配；轨口内的包布、石板台阶和袋衬各有真实求交面。复现新版成片时可在上一条配置中加 `ACG_BACKGROUND_SPP=24`，只降低带安全边距的桌外像素预算。
+
 ## 代码从哪里读
 
 - [`physics.py`](physics.py)：可重复的开球模拟，输出各帧的球心坐标。

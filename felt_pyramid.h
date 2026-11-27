@@ -19,10 +19,10 @@ struct Grid {
 // Four certified corners therefore cover the full support of either level.
 ACG_HD inline bool anchor(int x,int y,int w,int h,const Balls& balls,Vec& p) {
     if(!overhead_slate_clear) return false;
-    const float aspect=float(w)/h, halfheight=hi(.77f,1.40f/aspect);
-    p={(2*(x+.5f)/w-1)*aspect*halfheight,0,(2*(y+.5f)/h-1)*halfheight};
+    const float metres_per_pixel=camera_pixel_width(w,h);
+    p=camera_plane(x+.5f,y+.5f,w,h,metres_per_pixel);
     // Full pixel jitter, a conservative 4 mm thin-lens bound, and roundoff.
-    const float support=(pitch+.5f)*2*halfheight/h+.004f+4*eps;
+    const float support=(pitch+.5f)*metres_per_pixel+.004f+4*eps;
     if(fabsf(p.x)+support>=table_clear_x || fabsf(p.z)+support>=table_clear_z) return false;
     for(const Vec c:balls.c)
         if(fabsf(c.x-p.x)<=support+contact_pad && fabsf(c.z-p.z)<=support+contact_pad) return false;
