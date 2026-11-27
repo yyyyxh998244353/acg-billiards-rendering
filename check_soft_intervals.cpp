@@ -166,6 +166,57 @@ int main() {
             return 1;
         }
     }
+    {
+        Balls balls{};
+        float positions[32];
+        for(auto& position:positions) position=3;
+        place_balls(balls,0,positions);
+
+        const Ray overhead={{0,camera_height,0},{0,-1,0}};
+        Hit hit;
+        if(!intersect(overhead,balls,2,eps,far_t,hit) ||
+           hit.mat!=Felt || hit.t!=camera_height || hit.normal.y!=1 ||
+           intersect(overhead,balls,2,eps,camera_height,hit) ||
+           !intersect(overhead,balls,2,camera_height,far_t,hit) ||
+           hit.mat!=Felt || hit.t<=camera_height || hit.normal.y!=-1) {
+            std::fputs("Overhead slate changed a hit or an interval endpoint.\n",stderr);
+            return 1;
+        }
+        // Approach the edge of the clear column at nearly the maximum slope.
+        const Ray oblique={{table_clear_x-.0201f,camera_height,table_clear_z-.0201f},
+                           unit({max_overhead_lateral_speed,-1,max_overhead_lateral_speed})};
+        const float oblique_depth=(0.f-oblique.o.y)*recip(oblique.d.y);
+        if(!intersect(oblique,balls,2,eps,far_t,hit) || hit.mat!=Felt ||
+           hit.t!=oblique_depth || hit.normal.y!=1) {
+            std::fputs("Oblique overhead ray missed the slate top.\n",stderr);
+            return 1;
+        }
+
+        positions[0]=positions[1]=0;
+        place_balls(balls,0,positions);
+        // The ball and slate both intersect this ray at the ball's exit.
+        const Ray tied={{0,radius,0},{0,-1,0}};
+        const auto tie_matches=[&] {
+            return intersect(tied,balls,2,eps,far_t,hit) && hit.mat==Ball &&
+                   hit.id==0 && hit.t==radius && fabsf(hit.normal.y+1)<1.e-6f &&
+                   hit.normal.x==0 && hit.normal.z==0 &&
+                   !intersect(tied,balls,2,eps,radius,hit);
+        };
+        bool match=tie_matches();
+#ifdef ACG_PACKED_ROOM
+        PackedBalls packed;
+        prepare_packed_balls(balls,packed);
+        match=tie_matches() && match;
+#endif
+        BallBVH tree;
+        build_ball_bvh(tree,balls);
+        balls.tree=&tree;
+        if(!tie_matches() || !match) {
+            std::fputs("Ball and slate tie changed the selected hit.\n",stderr);
+            return 1;
+        }
+    }
+    std::puts("Overhead slate endpoints and ball priority passed.");
     std::puts("Point shadow ball, slate and emitter occlusion passed.");
     std::puts("72 quadrature slices, blockage, tangency, grazing BRDF and area-light weights passed.");
 }

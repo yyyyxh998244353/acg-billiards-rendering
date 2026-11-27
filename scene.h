@@ -482,6 +482,9 @@ inline BallCounters ball_counters;
 #endif
 #include "ball_bvh.h"
 
+constexpr float max_overhead_lateral_speed=.01f;
+constexpr float min_overhead_downward_speed=.99f;
+
 #ifdef ACG_PACKED_ROOM
 inline void prepare_packed_balls(Balls& balls,PackedBalls& packed) {
     for(int i=0;i<16;++i) {
@@ -523,9 +526,6 @@ inline uint32_t packed_ball_candidates(const PackedBalls& packed,Ray r) {
     }
     return slots;
 }
-
-constexpr float max_overhead_lateral_speed=.01f;
-constexpr float min_overhead_downward_speed=.99f;
 
 // For the slate shortcut's rays, moving the perpendicular residual to the
 // ball-center plane adds at most radius*|dx/dy| (or radius*|dz/dy|) per axis.
@@ -831,7 +831,7 @@ ACG_HD inline bool intersect_with_inverse(Ray r,Vec inv,const Balls &balls,int s
 
 ACG_HD inline bool intersect(Ray r,const Balls &balls,int stage,float t0,float t1,Hit &h) {
     const Vec inv=invdir(r.d);
-#ifdef ACG_PACKED_ROOM
+#if !defined(__CUDACC__) && !defined(__CUDA__)
     if constexpr(overhead_slate_clear) {
         constexpr float inset=.02f;
         static_assert(camera_height*max_overhead_lateral_speed/min_overhead_downward_speed < inset);
