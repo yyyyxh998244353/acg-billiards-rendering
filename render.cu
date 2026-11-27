@@ -19,6 +19,7 @@
 
 #ifdef __CUDACC__
 #include <cuda_runtime.h>
+#include <new>
 #define RENDER_HD __host__ __device__
 #else
 #define RENDER_HD
@@ -136,7 +137,25 @@ RENDER_HD inline RGB8 render_pixel(int x,int y,int w,int h,int stage,int spp,con
 }
 
 #ifdef __CUDACC__
+template<bool SharedPose>
 __global__ void render_pixels(RGB8* pixels,size_t count,int w,int h,int stage,int spp,const Balls* device_balls,unsigned poses,u32 sample_seed,const float* cache) {
+    if constexpr (SharedPose) {
+        __shared__ BallBVH block_tree;
+        alignas(Balls) __shared__ unsigned char pose_storage[sizeof(Balls)];
+        __shared__ const Balls* block_pose;
+        const unsigned node = threadIdx.x;
+        if (node < BallBVH::node_count) {
+            block_tree.box[node] = device_balls->tree->box[node];
+            block_tree.tag[node] = device_balls->tree->tag[node];
+        }
+        if (node == 0) {
+            auto* pose = ::new (pose_storage) Balls(*device_balls);
+            pose->tree = &block_tree;
+            block_pose = pose;
+        }
+        __syncthreads();
+        device_balls = block_pose;
+    }
     const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
     for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < count; i += stride) {
         const int x = static_cast<int>(i % w), y = static_cast<int>(i / w);
@@ -251,6 +270,7 @@ int main(int argc, char** argv) try {
     CUDA_CHECK(cudaEventCreate(&begin));
     CUDA_CHECK(cudaEventCreate(&end));
     constexpr unsigned threads = 128;
+    static_assert(threads >= BallBVH::node_count);
 #endif
     for(size_t frame=0;frame<(sequence_mode?frames.size():1);++frame) {
     for(unsigned i=0;i<poses;++i) {
@@ -326,7 +346,10 @@ int main(int argc, char** argv) try {
     const double upload_ms=elapsed_ms(upload_start);
     const unsigned blocks = static_cast<unsigned>(std::min<size_t>((count - 1) / threads + 1, 65535));
     CUDA_CHECK(cudaEventRecord(begin));
-    render_pixels<<<blocks, threads>>>(device,count,w,h,stage,spp,device_balls,poses,sample_seed,device_cache);
+    if (poses == 1 && use_tree)
+        render_pixels<true><<<blocks, threads>>>(device,count,w,h,stage,spp,device_balls,poses,sample_seed,device_cache);
+    else
+        render_pixels<false><<<blocks, threads>>>(device,count,w,h,stage,spp,device_balls,poses,sample_seed,device_cache);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaEventRecord(end));
     CUDA_CHECK(cudaEventSynchronize(end));
