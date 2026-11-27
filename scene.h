@@ -138,10 +138,17 @@ constexpr float pocket_x=1.283f,pocket_z=.652f,bore=.069f;
 constexpr float pocket_mouth_y=.049f,pocket_throat=.056f,pocket_bevel=.025f;
 constexpr float pocket_slope=(bore-pocket_throat)/pocket_bevel;
 constexpr float pocket_seam=pocket_mouth_y-pocket_bevel;
+// The visible liner narrows in two sections below the slate, rather than
+// putting a vertical cylinder behind the mouth's small top bevel.
+constexpr float pocket_floor_y=-.155f,pocket_floor_radius=.040f;
+constexpr float pocket_neck_y=-.030f,pocket_neck_radius=.047f;
+constexpr float pocket_lower_slope=(pocket_neck_radius-pocket_floor_radius)/(pocket_neck_y-pocket_floor_y);
+constexpr float pocket_upper_slope=(pocket_throat-pocket_neck_radius)/(pocket_seam-pocket_neck_y);
 constexpr float pocket_top=.056f,collar_bottom=.043f,collar_radius=.087f,collar_top_radius=.082f;
 constexpr float collar_slope=(collar_top_radius-collar_radius)/(pocket_top-collar_bottom);
 constexpr float rail_top=.048f,rail_half_width=.048f,rail_x=1.374f,rail_z=.739f;
 constexpr float table_nose_x=1.270f,table_nose_z=.635f;
+constexpr float cushion_nose_y=.635f*(2*radius),cushion_nose_round=.004f;
 constexpr float table_clear_x=1.20f,table_clear_z=.55f;
 template<int LeafSize=3>
 ACG_HD constexpr StaticScene make_room() {
@@ -162,12 +169,12 @@ ACG_HD constexpr StaticScene make_room() {
         float qz=side*.667f,qx=side*1.302f;
         for(int half=-1;half<=1;half+=2) {
             float cx=half*.638f;
-            s.add({cx-.581f,0,qz-.032f},{cx+.581f,.044f,qz+.032f},CushionCloth,CushionX,side);
+            s.add({cx-.581f,0,qz-.032f},{cx+.581f,.046f,qz+.032f},CushionCloth,CushionX,side);
         }
-        s.add({qx-.032f,0,-.581f},{qx+.032f,.044f,.581f},CushionCloth,CushionZ,side);
+        s.add({qx-.032f,0,-.581f},{qx+.032f,.046f,.581f},CushionCloth,CushionZ,side);
         for(int k=-1;k<=1;++k) {
             float cx=k*pocket_x,cz=side*pocket_z;
-            s.add({cx-collar_radius,-.155f,cz-collar_radius},
+            s.add({cx-collar_radius,pocket_floor_y,cz-collar_radius},
                   {cx+collar_radius,pocket_top,cz+collar_radius},Leather,Well);
         }
     }
@@ -570,6 +577,10 @@ ACG_HD inline float pocket_distance2(Vec v) {
     float z=fabsf(v.z)-pocket_z; return x*x+z*z;
 }
 ACG_HD inline float pocket_opening(float y) {
+    if(y<pocket_neck_y)
+        return pocket_floor_radius+pocket_lower_slope*hi(0.f,y-pocket_floor_y);
+    if(y<pocket_seam)
+        return pocket_neck_radius+pocket_upper_slope*(y-pocket_neck_y);
     return pocket_throat+pocket_slope*clamp(y-pocket_seam,0.f,pocket_bevel);
 }
 ACG_HD constexpr Vec basis_axis(int k,float s) {
@@ -676,16 +687,18 @@ ACG_HD inline void primitive(const Prim &p,Ray r,Vec inv,float t0,Hit &h) {
         const float bottom=(b.a.y-r.o.y)*inv.y;
         if(bottom>t0 && bottom<h.t) {
             Vec p=v+r.d*bottom;
-            if(p.x*p.x+p.z*p.z<=pocket_throat*pocket_throat)
+            if(p.x*p.x+p.z*p.z<=pocket_floor_radius*pocket_floor_radius)
                 record(h,bottom,NeedNormal?Vec{0,1,0}:Vec{},Ebony);
         }
-        // Two interior sections, a raised inner return, and an outer bevel.
-        for(int part=0;part<4;++part) {
-            const bool outer=part==3,raised=part>=2;
-            const float y0=outer?collar_bottom:(raised?pocket_mouth_y:(part?pocket_seam:b.a.y));
-            const float y1=raised?pocket_top:(part?pocket_mouth_y:pocket_seam);
-            const float k=outer?collar_slope:(part==1?pocket_slope:0.f);
-            const float section_radius=outer?collar_radius:(raised?bore:pocket_throat);
+        // Three connected tapers below the collar, then its inner and outer returns.
+        for(int part=0;part<5;++part) {
+            const bool outer=part==4,raised=part>=3;
+            const float y0=outer?collar_bottom:(raised?pocket_mouth_y:
+                (part==2?pocket_seam:(part==1?pocket_neck_y:pocket_floor_y)));
+            const float y1=raised?pocket_top:(part==2?pocket_mouth_y:(part==1?pocket_seam:pocket_neck_y));
+            const float k=outer?collar_slope:(raised?0.f:
+                (part==2?pocket_slope:(part==1?pocket_upper_slope:pocket_lower_slope)));
+            const float section_radius=outer?collar_radius:pocket_opening(y0);
             const float r0=section_radius+k*(r.o.y-y0),rd=k*r.d.y;
             float a=r.d.x*r.d.x+r.d.z*r.d.z-rd*rd;
             float beta=v.x*r.d.x+v.z*r.d.z-r0*rd;
@@ -732,10 +745,18 @@ ACG_HD inline void primitive(const Prim &p,Ray r,Vec inv,float t0,Hit &h) {
                !clip(s,r,out+up,anchor,rail_half_width-.009f) ||
                !clip(s,r,-out+up,anchor,rail_half_width-.006f)) return;
         } else {
-            anchor=anchor-out*.032f; anchor.y=.029f;
+            anchor=anchor-out*.032f; anchor.y=cushion_nose_y;
+            const Vec up={0,1,0};
+            // Tangent planes approximate a small rounded contact nose without
+            // a second ray primitive. The supported front line stays fixed.
+            if(!clip(s,r,-out+up*.38f,anchor,cushion_nose_round*.06977f) ||
+               !clip(s,r,-out+up*1.18f,anchor,cushion_nose_round*.54674f) ||
+               !clip(s,r,-out-up*.56f,anchor,cushion_nose_round*.14612f)) return;
             const float length=.5f*dot(b.b-b.a,along);
-            if(!clip(s,r,-out+Vec{0,.83f,0},anchor,0) || !clip(s,r,-out+Vec{0,-.46f,0},anchor,0) ||
-               !clip(s,r,along-out*.58f,anchor,length-.025f) || !clip(s,r,-along-out*.58f,anchor,length-.025f)) return;
+            const bool plus_corner=!along_x || anchor.x>0;
+            const bool minus_corner=!along_x || anchor.x<0;
+            if(!clip(s,r,along-out*(plus_corner?.77f:.25f),anchor,length-(plus_corner?.017f:.009f)) ||
+               !clip(s,r,-along-out*(minus_corner?.77f:.25f),anchor,length-(minus_corner?.017f:.009f))) return;
         }
     }
     for(int k=0;k<2;++k) {
@@ -1067,8 +1088,8 @@ ACG_HD inline Material material(Hit h,Vec p,const Balls &balls,float t,int stage
             const float along=end?p.z:p.x;
             const float cross_rail=end?fabsf(p.x)-1.302f:fabsf(p.z)-.667f;
             const float weave=cloth_finish(along,cross_rail+.30f*p.y);
-            const float binding=1-.20f*hi(0,1-fabsf(cross_rail-.024f)/.003f);
-            return {Vec{.024f,.209f,.128f}*(weave*binding),grey(.019f),.85f};
+            const float binding=1-.14f*hi(0,1-fabsf(cross_rail-.024f)/.0016f);
+            return {Vec{.024f,.214f,.133f}*(weave*binding),grey(.021f),.88f};
         }
         case Timber: {
             const float joint=(fabsf(p.x)-rail_x)-(fabsf(p.z)-rail_z);
@@ -1094,17 +1115,18 @@ ACG_HD inline Material material(Hit h,Vec p,const Balls &balls,float t,int stage
             const float r=sqrtf(pocket_distance2(p));
             const float texture=.5f+.5f*sinf(620*r+183*p.y);
             const float welt=hi(0,1-fabsf(r-.078f)/.0022f);
-            const Vec c=mix({.081f,.035f,.014f},{.166f,.085f,.036f},texture*.24f+welt*.46f);
-            return varnish(c,.39f);
+            const Vec c=mix({.048f,.028f,.017f},{.103f,.066f,.042f},texture*.18f+welt*.48f);
+            return varnish(c,.49f);
         }
         case Ebony: {
             const float weave=.84f+.16f*sinf(820*p.x)*sinf(730*p.z);
             return varnish(Vec{.039f,.031f,.024f}*weave,.86f);
         }
         case Leather: {
-            const float pebble=.89f+.08f*sinf(1150*p.x+510*p.y)*sinf(1030*p.z-290*p.y);
-            const float seam=hi(0,1-fabsf(p.y-(pocket_seam-.009f))/.002f);
-            return varnish(Vec{.051f,.024f,.011f}*(pebble*(1-.38f*seam)),.69f);
+            const float pebble=.91f+.06f*sinf(610*p.x+310*p.y)*sinf(570*p.z-240*p.y);
+            const float seam=hi(0,1-fabsf(p.y-pocket_neck_y)/.002f);
+            const Vec leather=p.y>=pocket_neck_y?Vec{.102f,.062f,.034f}:Vec{.053f,.031f,.020f};
+            return varnish(leather*(pebble*(1-.27f*seam)),.64f);
         }
         case Wall: {
             float z=fabsf(h.normal.x)>.5f?p.z:p.x;

@@ -247,7 +247,7 @@ int main() {
             const float x=column*pocket_x,z=side*pocket_z;
             Hit catcher,trim;
             if(!from_above(x,z,catcher) || catcher.mat!=Ebony ||
-               fabsf(catcher.t-(camera_height+.155f))>2*eps ||
+               fabsf(catcher.t-(camera_height-pocket_floor_y))>2*eps ||
                !from_above(x,z+side*trim_sample,trim) || trim.mat!=PocketTrim ||
                fabsf(trim.t-(camera_height-pocket_top))>2*eps || trim.normal.y!=1.f) {
                 std::fputs("Pocket center or raised trim gave the wrong surface.\n",stderr);
@@ -270,6 +270,31 @@ int main() {
            end_bevel.normal.y<.70f || end_bevel.normal.x<.70f) {
             std::fputs("Pocket lining, clear cloth, or timber bevel is incorrect.\n",stderr);
             return 1;
+        }
+
+        for(int side:{-1,1}) for(int column:{-1,0,1}) {
+            const float x=column*pocket_x,z=side*pocket_z;
+            for(float y:{-.010f,-.090f}) {
+                const float radial=pocket_opening(y);
+                Hit wall;
+                if(!from_above(x+radial,z,wall) || wall.mat!=Leather ||
+                   fabsf(wall.t-(camera_height-y))>4*eps || wall.normal.x>=0 || wall.normal.y<=0) {
+                    std::fputs("An interior pocket taper did not expose its expected depth.\n",stderr);
+                    return 1;
+                }
+            }
+        }
+        for(int side:{-1,1}) {
+            const Ray toward_nose={{.35f,cushion_nose_y,side*.585f},{0,0,float(side)}};
+            Hit nose,shoulder;
+            if(!intersect(toward_nose,balls,2,eps,far_t,nose) || nose.mat!=CushionCloth ||
+               fabsf(nose.t-(table_nose_z-.585f))>2*eps || nose.normal.z!=-float(side) ||
+               !from_above(.35f,side*(table_nose_z+.003f),shoulder) ||
+               shoulder.mat!=CushionCloth || shoulder.normal.y<=0 || side*shoulder.normal.z>=0 ||
+               !(shoulder.t>camera_height-.046f && shoulder.t<camera_height-cushion_nose_y)) {
+                std::fputs("Cushion nose lost its contact line or rounded shoulder.\n",stderr);
+                return 1;
+            }
         }
 
         for(float offset:{-.001f,.001f}) {
