@@ -1097,7 +1097,7 @@ ACG_HD inline float visibility(Ray r,float limit,const Balls &balls,int stage,bo
     return through;
 }
 
-#ifdef ACG_PACKED_ROOM
+#if !defined(__CUDACC__) && !defined(__CUDA__)
 constexpr float shadow_column_margin=.001f;
 // The area emitter is intersected separately from the room BVH.
 constexpr bool shadow_column_clear=
@@ -1111,7 +1111,7 @@ ACG_HD inline float visibility_to_light(Vec origin,Vec source,const Balls &balls
     const Ray ray={origin,delta*(1/distance)};
     const float limit=distance-3*eps;
     bool skip_static=false;
-#ifdef ACG_PACKED_ROOM
+#if !defined(__CUDACC__) && !defined(__CUDA__)
     if constexpr(shadow_column_clear) {
         // Both ends lie inside the clear column. The inset covers rounding in
         // the normalized direction and slab comparisons.

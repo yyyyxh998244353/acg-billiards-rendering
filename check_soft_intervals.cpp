@@ -140,6 +140,21 @@ int main() {
             std::fputs("Point shadow changed slate or emitter occlusion.\n",stderr);
             return 1;
         }
+
+        // Only the source lies in the clear column. The ray crosses a
+        // partially opaque part of the grille before entering the column.
+        const Vec behind_grille={.658f,.12f,-.75f};
+        const Vec inside_column={.658f,.69f,-.56f};
+#ifdef ACG_OPAQUE_MASK
+        constexpr float grille_visibility=0.f;
+#else
+        constexpr float grille_visibility=.35f;
+#endif
+        if(!(fabsf(visibility_to_light(behind_grille,inside_column,balls,1)-grille_visibility)<1.e-6f)) {
+            std::fputs("Point shadow lost grille attenuation.\n",stderr);
+            return 1;
+        }
+
         positions[0]=positions[1]=0;
         place_balls(balls,0,positions);
         const auto ball_cutoffs_match=[&] {
@@ -217,6 +232,6 @@ int main() {
         }
     }
     std::puts("Overhead slate endpoints and ball priority passed.");
-    std::puts("Point shadow ball, slate and emitter occlusion passed.");
+    std::puts("Point shadow ball, slate, grille and emitter occlusion passed.");
     std::puts("72 quadrature slices, blockage, tangency, grazing BRDF and area-light weights passed.");
 }
