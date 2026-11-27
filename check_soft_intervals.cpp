@@ -1,7 +1,8 @@
 // Compile from the repository root: g++ -O2 -std=c++17 check_soft_intervals.cpp -o check_soft && ./check_soft
-#include "scene.h"
+#include "felt_pyramid.h"
 #include <cstdio>
 #include <initializer_list>
+#include <limits>
 
 int main() {
     using namespace acg_scene_detail;
@@ -293,6 +294,74 @@ int main() {
             return 1;
         }
     }
+    {
+        using namespace acg_felt;
+        Vec cells[36];
+        for(auto& cell:cells) cell={2,3,4};
+        const Grid fine={cells,6,6};
+        if(coarse_node(fine,1,1).z!=4 || bilinear(fine,9,21,pitch).y!=3 ||
+           bilinear(fine,5*pitch,0,pitch).x>=0) {
+            std::fputs("Felt pyramid changed constant lighting or extrapolated past the grid.\n",stderr);
+            return 1;
+        }
+        cells[3*6+2]={std::numeric_limits<float>::quiet_NaN(),0,0};
+        if(coarse_node(fine,1,1).x>=0 || bilinear(fine,17,17,pitch).x>=0 ||
+           bilinear(fine,9,9,pitch).x!=2) {
+            std::fputs("Felt pyramid interpolated through a rejected receiver.\n",stderr);
+            return 1;
+        }
+        Vec impulse[13*13],filtered[7*7];
+        for(auto& v:impulse) v=grey(1);
+        impulse[6*13+6]=grey(2);
+        const Grid impulse_grid={impulse,13,13},coarse={filtered,7,7};
+        for(int y=0;y<7;++y) for(int x=0;x<7;++x) filtered[y*7+x]=coarse_node(impulse_grid,x,y);
+        float excess=0;
+        for(int y=0;y<13;++y) for(int x=0;x<13;++x)
+            excess+=blend_node(impulse[y*13+x],coarse,x,y).x-1;
+        if(fabsf(excess-1)>1.e-5f) {
+            std::fputs("Layer blending amplified an interior lighting impulse.\n",stderr);
+            return 1;
+        }
+        if(overhead_slate_clear) {
+            Balls balls{};
+            float positions[32];
+            for(auto& value:positions) value=3;
+            place_balls(balls,0,positions);
+            Vec p;
+            if(anchor(0,0,1920,1080,balls,p) || !anchor(960,540,1920,1080,balls,p)) {
+                std::fputs("Felt pyramid admitted a rail or rejected the open slate.\n",stderr);
+                return 1;
+            }
+            const Ray ray={{p.x,camera_height,p.z},{0,-1,0}};
+            positions[0]=p.x+.06f; positions[1]=p.z;
+            Balls contact{};
+            place_balls(contact,0,positions);
+            if(anchor(960,540,1920,1080,contact,p)) {
+                std::fputs("Felt pyramid admitted a ball contact neighborhood.\n",stderr);
+                return 1;
+            }
+            // Compare linear means at a certified, colocated hit. The same
+            // proposal cancels the direct/light-hit partition samplewise;
+            // deeper roulette may pick different survivors for each split.
+            constexpr int n=8192;
+            double sum[3]={},squares[3]={};
+            for(int i=0;i<n;++i) {
+                Rng a={hash32(i+32957u)},b=a,c=a;
+                const Vec f=trace(ray,balls,2,0,a);
+                const Vec basis=trace_felt_pass<FeltPass::Basis>(ray,balls,2,0,b);
+                const Vec rebuilt=trace_felt_pass<FeltPass::Residual>(ray,balls,2,0,c,false,-1.f,basis);
+                const Vec error=rebuilt-f;
+                for(int j=0;j<3;++j) {
+                    const double v=axis(error,j); sum[j]+=v; squares[j]+=v*v;
+                }
+            }
+            for(int j=0;j<3;++j) if(fabs(sum[j]/n)>5*sqrt(squares[j])/n+2.e-5) {
+                std::fputs("Felt basis plus residual changed the colocated radiance mean.\n",stderr);
+                return 1;
+            }
+        }
+    }
+    std::puts("Felt pyramid support and linear lighting split passed.");
     std::puts("Six pocket openings, raised trim, inner lining and timber bevels passed.");
     std::puts("Overhead slate endpoints and ball priority passed.");
     std::puts("Point shadow ball, slate, grille and emitter occlusion passed.");

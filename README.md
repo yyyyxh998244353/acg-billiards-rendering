@@ -39,6 +39,8 @@ ffmpeg -framerate 30 -i outputs/break-1080p/frame-%04d.ppm \
 
 集群上只需在 GPU 作业中运行 `--phase render`；编译、轨迹生成和编码不需要 GPU。脚本不会自行提交 Slurm 作业。`timings.csv` 分别记录场景准备、上传、渲染、回读和写盘时间。
 
+如果想重现**分层降噪版**，用一个新输出目录，把上面的 `--spp 48` 改为 `--spp 96`，并在 `--phase render` 的命令前加 `ACG_FELT_CACHE=384 ACG_FELT_LOCAL_SPP=24`。它用高采样锚点重建台布的低频漫反射光照；球、球袋和半影仍走完整路径。该模式只支持 CUDA 单姿态 stage 2，不与其他阴影缓存叠加。
+
 ## 代码从哪里读
 
 - [`physics.py`](physics.py)：可重复的开球模拟，输出各帧的球心坐标。

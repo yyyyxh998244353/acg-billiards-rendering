@@ -25,6 +25,9 @@
 #define RENDER_HD
 #endif
 #include "scene.h"
+#ifdef __CUDACC__
+#include "felt_pyramid.h"
+#endif
 using acg_scene_detail::BallBVH;
 using acg_scene_detail::Balls;
 #include "sequence.h"
@@ -137,8 +140,60 @@ RENDER_HD inline RGB8 render_pixel(int x,int y,int w,int h,int stage,int spp,con
 }
 
 #ifdef __CUDACC__
-template<bool SharedPose>
-__global__ void render_pixels(RGB8* pixels,size_t count,int w,int h,int stage,int spp,const Balls* device_balls,unsigned poses,u32 sample_seed,const float* cache) {
+using acg_felt::Grid;
+
+__global__ void sample_felt_anchors(Vec* values,int nx,int ny,int w,int h,int spp,u32 seed,const Balls* balls) {
+    using namespace acg_scene_detail;
+    const int i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i>=nx*ny) return;
+    Vec p;
+    if(!acg_felt::anchor((i%nx)*acg_felt::pitch,(i/nx)*acg_felt::pitch,w,h,*balls,p)) {
+        values[i]=acg_felt::invalid;
+        return;
+    }
+    const Ray ray={{p.x,camera_height,p.z},{0,-1,0}};
+    const u32 key=mix_bits(seed^mix_bits(static_cast<u32>(i)^0x4d2a1e67u));
+    Vec sum{};
+    for(int s=0;s<spp;++s) {
+        Rng rng={mix_bits(key+static_cast<u32>(s))};
+        sum=sum+trace_felt_pass<FeltPass::Basis>(ray,*balls,2,0.f,rng);
+    }
+    const Vec v=sum*(1.f/spp);
+    values[i]=(v.x>=0 && isfinite(v.x) && isfinite(v.y) && isfinite(v.z))?v:acg_felt::invalid;
+}
+
+__global__ void coarsen_felt(Vec* values,int nx,int ny,Grid fine) {
+    const int i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<nx*ny) values[i]=acg_felt::coarse_node(fine,i%nx,i/nx);
+}
+
+__global__ void blend_felt(Vec* values,int nx,int ny,Grid coarse) {
+    const int i=blockIdx.x*blockDim.x+threadIdx.x;
+    if(i<nx*ny) values[i]=acg_felt::blend_node(values[i],coarse,i%nx,i/nx);
+}
+
+__device__ inline RGB8 render_felt_pixel(int x,int y,int w,int h,int spp,const Balls& balls,
+                                        RowSeed row,Vec irradiance) {
+    using namespace acg_scene_detail;
+    const auto column=static_cast<u32>(x);
+    const u32 first=mix_bits(row.sample_key^column);
+    const u32 path_key=row.path_key^hash32(column+0x9e3779b9u);
+    Vec sum{};
+    for(int s=0;s<spp;++s) {
+        const u32 seed=mix_bits(first+static_cast<u32>(s));
+        Rng rng={hash32((seed?seed:base_seed)^path_key)};
+        const Ray ray=camera(x,y,w,h,2,rng);
+        sum=sum+trace_felt_pass<FeltPass::Residual>(ray,balls,2,0.f,rng,false,-1.f,irradiance);
+    }
+    const float inv=1.f/spp;
+    return {display_byte(sum.x*inv),display_byte(sum.y*inv),display_byte(sum.z*inv)};
+}
+
+enum class PixelPass { Full, Felt, Fallback };
+
+template<bool SharedPose,PixelPass Pass=PixelPass::Full>
+__global__ void render_pixels(RGB8* pixels,size_t count,int w,int h,int stage,int spp,const Balls* device_balls,
+                              unsigned poses,u32 sample_seed,const float* cache,Grid felt={}) {
     if constexpr (SharedPose) {
         __shared__ BallBVH block_tree;
         alignas(Balls) __shared__ unsigned char pose_storage[sizeof(Balls)];
@@ -159,7 +214,15 @@ __global__ void render_pixels(RGB8* pixels,size_t count,int w,int h,int stage,in
     const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
     for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < count; i += stride) {
         const int x = static_cast<int>(i % w), y = static_cast<int>(i / w);
-        pixels[i] = render_pixel(x,y,w,h,stage,spp,device_balls,poses,row_seed(y,sample_seed),cache?cache[i]:-1.f);
+        const RowSeed row=row_seed(y,sample_seed);
+        if constexpr (Pass==PixelPass::Felt) {
+            const Vec irradiance=acg_felt::bilinear(felt,x,y,acg_felt::pitch);
+            if(irradiance.x>=0) pixels[i]=render_felt_pixel(x,y,w,h,spp,*device_balls,row,irradiance);
+        } else {
+            if constexpr (Pass==PixelPass::Fallback)
+                if(acg_felt::valid_cell(felt,x,y,acg_felt::pitch)) continue;
+            pixels[i]=render_pixel(x,y,w,h,stage,spp,device_balls,poses,row,cache?cache[i]:-1.f);
+        }
     }
 }
 
@@ -248,6 +311,21 @@ int main(int argc, char** argv) try {
     const auto frames=sequence_mode?sequence::read_manifest(argv[7]):std::vector<sequence::Frame>{};
     float balls[64 * 32];
     const unsigned poses=sequence_mode?1:argc-7;
+    const char* felt_setting=std::getenv("ACG_FELT_CACHE");
+    const char* felt_local=std::getenv("ACG_FELT_LOCAL_SPP");
+    if(felt_local && !felt_setting) throw std::runtime_error("ACG_FELT_LOCAL_SPP requires ACG_FELT_CACHE");
+#ifndef __CUDACC__
+    if(felt_setting) throw std::runtime_error("ACG_FELT_CACHE requires CUDA");
+#else
+    const int requested_anchors=felt_setting?integer(felt_setting,1,imax,"felt anchor spp"):0;
+    const int felt_spp=felt_local?integer(felt_local,1,spp,"local felt spp"):std::max(1,spp/2);
+    if(requested_anchors && (stage!=2 || poses!=1 || w>8192 || h>8192 || analytic_shadow ||
+                             std::getenv("ACG_INTERPOLATE")))
+        throw std::runtime_error("ACG_FELT_CACHE requires single-pose stage 2, dimensions <=8192 and no shadow cache");
+    const int anchor_spp=acg_scene_detail::overhead_slate_clear?requested_anchors:0;
+    if(requested_anchors && !anchor_spp)
+        std::cerr << "Felt pyramid disabled: no certified clear slate.\n";
+#endif
     BallBVH prior{};
     const std::uint64_t count64 = static_cast<std::uint64_t>(w) * h;
     if (count64 > std::numeric_limits<size_t>::max() / sizeof(RGB8) ||
@@ -271,6 +349,15 @@ int main(int argc, char** argv) try {
     CUDA_CHECK(cudaEventCreate(&end));
     constexpr unsigned threads = 128;
     static_assert(threads >= BallBVH::node_count);
+    Vec *fine=nullptr,*coarse=nullptr;
+    const int nx=(w-1)/acg_felt::pitch+1,ny=(h-1)/acg_felt::pitch+1;
+    const int cx=(nx+1)/2,cy=(ny+1)/2;
+    cudaEvent_t felt_end{};
+    if(anchor_spp) {
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&fine),size_t(nx)*ny*sizeof(Vec)));
+        CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&coarse),size_t(cx)*cy*sizeof(Vec)));
+        CUDA_CHECK(cudaEventCreate(&felt_end));
+    }
 #endif
     for(size_t frame=0;frame<(sequence_mode?frames.size():1);++frame) {
     for(unsigned i=0;i<poses;++i) {
@@ -346,7 +433,28 @@ int main(int argc, char** argv) try {
     const double upload_ms=elapsed_ms(upload_start);
     const unsigned blocks = static_cast<unsigned>(std::min<size_t>((count - 1) / threads + 1, 65535));
     CUDA_CHECK(cudaEventRecord(begin));
-    if (poses == 1 && use_tree)
+    if(anchor_spp) {
+        const Grid fine_grid={fine,nx,ny},coarse_grid={coarse,cx,cy};
+        const unsigned fine_blocks=(nx*ny+threads-1)/threads;
+        sample_felt_anchors<<<fine_blocks,threads>>>(fine,nx,ny,w,h,anchor_spp,sample_seed,device_balls);
+        CUDA_CHECK(cudaGetLastError());
+        coarsen_felt<<<(cx*cy+threads-1)/threads,threads>>>(coarse,cx,cy,fine_grid);
+        CUDA_CHECK(cudaGetLastError());
+        blend_felt<<<fine_blocks,threads>>>(fine,nx,ny,coarse_grid);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaEventRecord(felt_end));
+        // Separate the two paths so their shaders don't spill into a single
+        // oversized kernel. Every pixel belongs to exactly one dispatch.
+        if(use_tree) {
+            render_pixels<true,PixelPass::Felt><<<blocks,threads>>>(device,count,w,h,stage,felt_spp,device_balls,poses,sample_seed,nullptr,fine_grid);
+            CUDA_CHECK(cudaGetLastError());
+            render_pixels<true,PixelPass::Fallback><<<blocks,threads>>>(device,count,w,h,stage,spp,device_balls,poses,sample_seed,nullptr,fine_grid);
+        } else {
+            render_pixels<false,PixelPass::Felt><<<blocks,threads>>>(device,count,w,h,stage,felt_spp,device_balls,poses,sample_seed,nullptr,fine_grid);
+            CUDA_CHECK(cudaGetLastError());
+            render_pixels<false,PixelPass::Fallback><<<blocks,threads>>>(device,count,w,h,stage,spp,device_balls,poses,sample_seed,nullptr,fine_grid);
+        }
+    } else if (poses == 1 && use_tree)
         render_pixels<true><<<blocks, threads>>>(device,count,w,h,stage,spp,device_balls,poses,sample_seed,device_cache);
     else
         render_pixels<false><<<blocks, threads>>>(device,count,w,h,stage,spp,device_balls,poses,sample_seed,device_cache);
@@ -355,6 +463,11 @@ int main(int argc, char** argv) try {
     CUDA_CHECK(cudaEventSynchronize(end));
     float render_ms;
     CUDA_CHECK(cudaEventElapsedTime(&render_ms, begin, end));
+    if(anchor_spp) {
+        float felt_ms;
+        CUDA_CHECK(cudaEventElapsedTime(&felt_ms,begin,felt_end));
+        std::cerr << "felt_pyramid_ms=" << felt_ms << " pixel_ms=" << render_ms-felt_ms << '\n';
+    }
     const auto copy_start = Clock::now();
     CUDA_CHECK(cudaMemcpy(image.get(), device, bytes, cudaMemcpyDeviceToHost));
     const double d2h_ms = elapsed_ms(copy_start);
@@ -398,7 +511,7 @@ int main(int argc, char** argv) try {
         io_ms=elapsed_ms(io_start);
     }
     const double total_ms=elapsed_ms(total_start);
-    // render_ms = one kernel (sampling + tonemap) on CUDA, render loop on CPU.
+    // render_ms includes every CUDA sampling, reconstruction and tonemapping pass.
     // Frame wall time excludes manifest/snapshot parsing and persistent device setup.
     if(frame==0) std::cout << "backend,stage,width,height,spp,time,base_seed,render_ms,d2h_wall_ms,ppm_wall_ms,total_wall_ms,frame,prepare_ms,cache_ms,upload_ms\n";
     std::cout
@@ -413,6 +526,11 @@ int main(int argc, char** argv) try {
     CUDA_CHECK(cudaFree(device_balls));
     if(device_trees) CUDA_CHECK(cudaFree(device_trees));
     if(device_cache) CUDA_CHECK(cudaFree(device_cache));
+    if(anchor_spp) {
+        CUDA_CHECK(cudaEventDestroy(felt_end));
+        CUDA_CHECK(cudaFree(coarse));
+        CUDA_CHECK(cudaFree(fine));
+    }
 #endif
     return 0;
 } catch (const std::exception& e) {

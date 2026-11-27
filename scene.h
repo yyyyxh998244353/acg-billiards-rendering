@@ -1240,6 +1240,23 @@ ACG_HD inline float visibility_to_light(Vec origin,Vec source,const Balls &balls
 static_assert((ACG_AREA_SAMPLES)==1 || (ACG_AREA_SAMPLES)==2,
               "Expected one or two area-light samples");
 constexpr int area_samples=ACG_AREA_SAMPLES;
+
+enum class FeltPass { Full, Basis, Residual };
+
+// View-independent first-hit diffuse basis. Keep Schlick's directional
+// remainder, including any negative values, in the local estimator.
+ACG_HD constexpr Vec felt_diffuse_basis(Material m) {
+    return m.diffuse*(grey(1)-m.f0);
+}
+
+template<FeltPass Pass>
+ACG_HD inline Vec area_brdf(Vec f,Material m) {
+    if constexpr (Pass==FeltPass::Basis) return grey(1/pi);
+    if constexpr (Pass==FeltPass::Residual) return f-felt_diffuse_basis(m)*(1/pi);
+    return f;
+}
+
+template<FeltPass Pass=FeltPass::Full>
 ACG_HD inline Vec direct_sample(Vec p,Vec n,Vec wo,Vec org,Vec source,Vec intensity,bool area,
                                 Material m,const BrdfView& view,const Balls &balls,int stage,float cached,bool compete) {
     Vec delta=source-p; float d2=dot(delta,delta),dist=sqrtf(d2); Vec wi=delta*(1/dist);
@@ -1249,7 +1266,7 @@ ACG_HD inline Vec direct_sample(Vec p,Vec n,Vec wo,Vec org,Vec source,Vec intens
     float pdf; const Vec f=brdf(m,n,wo,wi,view,pdf);
     if(!area) return f*intensity*(vis*c/d2); // radiant intensity, inverse square
     float lp=d2/(wi.y*light_area);
-    return f*intensity*(vis*c*(compete?power_weight(area_samples*lp,pdf):1.f)/(lp*area_samples));
+    return area_brdf<Pass>(f,m)*intensity*(vis*c*(compete?power_weight(area_samples*lp,pdf):1.f)/(lp*area_samples));
 }
 #ifdef __CUDACC__
 ACG_HD __noinline__
@@ -1270,13 +1287,16 @@ bool analytic_area_sample(Vec p,Vec n,Vec wo,Vec q,Material m,const BrdfView& vi
     result=emission()*sum*(2*light_hz/area_samples);
     return true;
 }
+template<FeltPass Pass=FeltPass::Full>
 ACG_HD inline Vec lighting(Vec p,Vec n,Vec wo,Material m,const BrdfView& view,const Balls &balls,int stage,
                            Rng &rng,const Hit& hit,bool analytic,float cached,bool compete) {
     Vec I=stage==2?Vec{1.8f,1.63f,1.52f}:Vec{8.05f,7.35f,6.37f};
     const Vec origin=p+n*eps;
-    Vec out=direct_sample(p,n,wo,origin,point_light_position,I,false,m,view,balls,stage,cached,false);
+    Vec out{};
+    if constexpr (Pass!=FeltPass::Basis)
+        out=direct_sample(p,n,wo,origin,point_light_position,I,false,m,view,balls,stage,cached,false);
     if(stage==2 && p.y<light_y) {
-        const bool eligible=analytic && soft_eligible(stage,hit,p,n,balls.c);
+        const bool eligible=Pass==FeltPass::Full && analytic && soft_eligible(stage,hit,p,n,balls.c);
 #ifdef ACG_STRATIFY_LIGHT_2D
         // Randomly pair the X and Z strata; a fixed diagonal would leave half
         // of the emitter unsampled. The marginal light PDF is unchanged.
@@ -1294,7 +1314,9 @@ ACG_HD inline Vec lighting(Vec p,Vec n,Vec wo,Material m,const BrdfView& view,co
                 out=out+contribution;
                 continue;
             }
-            out=out+direct_sample(p,n,wo,origin,q,emission(),true,m,view,balls,stage,-1.f,compete);
+            // Only the certified felt passes may reuse full lamp visibility.
+            constexpr float vis=Pass==FeltPass::Full?-1.f:1.f;
+            out=out+direct_sample<Pass>(p,n,wo,origin,q,emission(),true,m,view,balls,stage,vis,compete);
         }
     }
     return out;
@@ -1308,7 +1330,9 @@ ACG_HD inline bool glass_bounce(Vec d,Vec n,bool entering,Rng &rng,Vec &dir,floa
     if(rng.next()<R) { dir=unit(d+n*(2*ci)); weight=1; return false; }
     dir=unit(d*eta+n*(eta*ci-ct)); weight=eta*eta; return true;
 }
-ACG_HD inline Vec trace(Ray ray,const Balls &balls,int stage,float t,Rng &rng,bool analytic=false,float cached=-1) {
+template<FeltPass Pass>
+ACG_HD inline Vec trace_felt_pass(Ray ray,const Balls &balls,int stage,float t,Rng &rng,
+                                  bool analytic=false,float cached=-1,Vec irradiance={}) {
     Vec out={},beta=grey(1),prev={}; float prev_pdf=0,eta_scale=1; bool delta=true,inside=false;
 #ifndef ACG_MAX_HITS
 #define ACG_MAX_HITS 14
@@ -1317,7 +1341,10 @@ ACG_HD inline Vec trace(Ray ray,const Balls &balls,int stage,float t,Rng &rng,bo
     static_assert(max_hits>=1 && max_hits<=14,"Invalid preview path depth");
     for(int depth=0;depth<max_hits;++depth) {
         Hit hit; float t0=eps;
-        for(;;) {
+        const bool felt=Pass!=FeltPass::Full && depth==0;
+        // The caller certifies the entire camera footprint on the top slate.
+        if(felt) record(hit,-ray.o.y/ray.d.y,{0,1,0},Felt);
+        else for(;;) {
             if(!intersect(ray,balls,stage,t0,far_t,hit)) return out;
             if(hit.mat!=Grille || rng.next()<coverage(ray.o+ray.d*hit.t)) break;
             t0=hit.t+eps;
@@ -1350,11 +1377,19 @@ ACG_HD inline Vec trace(Ray ray,const Balls &balls,int stage,float t,Rng &rng,bo
             const float vis=depth==0 && hit.mat==Felt && n.y==1 && fabsf(p.y)<eps?cached:-1.f;
             const bool continue_path=stage!=0 && depth+1<max_hits;
             const BrdfView view=prepare_brdf_view(m,n,wo);
-            out=out+beta*lighting(p,n,wo,m,view,balls,stage,rng,hit,analytic,vis,continue_path);
+            if(felt)
+                out=out+lighting<Pass>(p,n,wo,m,view,balls,stage,rng,hit,false,-1.f,continue_path);
+            else
+                out=out+beta*lighting(p,n,wo,m,view,balls,stage,rng,hit,analytic,vis,continue_path);
+            if constexpr (Pass==FeltPass::Residual)
+                if(felt) out=out+irradiance*felt_diffuse_basis(m);
             if(!continue_path) break;
             wi=sample_direction(n,wo,m.rough,view.specular_probability,rng); float c=dot(wi,n);
             if(c<=0) break;
             Vec f=brdf(m,n,wo,wi,view,prev_pdf); if(prev_pdf<=0) break;
+            // Keep the same sampling PDF and both sides of the emitter MIS
+            // partition for the basis and signed residual.
+            if(felt) f=area_brdf<Pass>(f,m);
             beta=beta*f*(c/prev_pdf); prev=p; delta=false;
         }
         if(depth>=3) {
@@ -1363,6 +1398,9 @@ ACG_HD inline Vec trace(Ray ray,const Balls &balls,int stage,float t,Rng &rng,bo
         ray={p+n*(dot(wi,n)>0?eps:-eps),wi};
     }
     return out;
+}
+ACG_HD inline Vec trace(Ray ray,const Balls &balls,int stage,float t,Rng &rng,bool analytic=false,float cached=-1) {
+    return trace_felt_pass<FeltPass::Full>(ray,balls,stage,t,rng,analytic,cached);
 }
 ACG_HD inline Ray camera(int x,int y,int w,int h,int stage,Rng &rng) {
     const float aspect=float(w)/float(h),halfheight=hi(.77f,1.40f/aspect);

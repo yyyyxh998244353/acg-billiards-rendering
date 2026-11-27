@@ -27,9 +27,10 @@ printf 'job_dir=%s\njob_id=%s\nnode=%s\nstart_utc=%s\ncuda_visible_devices=%s\n'
     "$job_dir" "$SLURM_JOB_ID" "$(hostname)" "$(date -u +%FT%TZ)" "${CUDA_VISIBLE_DEVICES:-unset}"
 printf 'width=%s height=%s spp=%s scene_time=%s\n' "$width" "$height" "$spp" "$time"
 printf '%s\n' 'exposure=1 tonemap=per-channel-Reinhard encoding=sRGB/P6 seed_base=0x63d83595'
-cp -- "$src"/{render.cu,scene.h,ball_bvh.h,sequence.h,interpolate.h,soft_intervals.h,physics.py} .
+sources=(render.cu scene.h felt_pyramid.h ball_bvh.h sequence.h interpolate.h soft_intervals.h physics.py)
+for source in "${sources[@]}"; do cp -- "$src/$source" .; done
 cp -- "$0" run.slurm
-sha256sum render.cu scene.h ball_bvh.h sequence.h interpolate.h soft_intervals.h physics.py run.slurm > sources.sha256
+sha256sum "${sources[@]}" run.slurm > sources.sha256
 python3 physics.py . | tee physics.log
 sha256sum before.txt after.txt > snapshots.sha256
 nvidia-smi --query-gpu=index,name,uuid,driver_version,memory.total --format=csv
