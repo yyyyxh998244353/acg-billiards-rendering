@@ -244,7 +244,7 @@ int main() {
         };
         constexpr float trim_sample=(bore+collar_top_radius)*.5f;
         for(int side:{-1,1}) for(int column:{-1,0,1}) {
-            const float x=column*pocket_x,z=side*pocket_z;
+            const float x=column*pocket_x,z=side*(column?pocket_z:side_pocket_z);
             Hit catcher,trim;
             if(!from_above(x,z,catcher) || catcher.mat!=Ebony ||
                fabsf(catcher.t-(camera_height-pocket_floor_y))>2*eps ||
@@ -261,8 +261,8 @@ int main() {
         }
 
         Hit cloth,lining,long_bevel,end_bevel;
-        if(!from_above(0,pocket_z-trim_sample,cloth) || cloth.mat!=Felt ||
-           !from_above((bore+pocket_throat)*.5f,pocket_z,lining) ||
+        if(!from_above(0,side_pocket_z-trim_sample,cloth) || cloth.mat!=Felt ||
+           !from_above((bore+pocket_throat)*.5f,side_pocket_z,lining) ||
            lining.mat!=Leather || lining.normal.x>=0 || lining.normal.y<=0 ||
            !from_above(.4f,.739f+.044f,long_bevel) || long_bevel.mat!=Timber ||
            long_bevel.normal.y<.70f || long_bevel.normal.z<.70f ||
@@ -273,7 +273,7 @@ int main() {
         }
 
         for(int side:{-1,1}) for(int column:{-1,0,1}) {
-            const float x=column*pocket_x,z=side*pocket_z;
+            const float x=column*pocket_x,z=side*(column?pocket_z:side_pocket_z);
             for(float y:{-.010f,-.090f}) {
                 const float radial=pocket_opening(y);
                 Hit wall;
@@ -296,6 +296,24 @@ int main() {
                 return 1;
             }
         }
+        for(int side:{-1,1}) for(int end:{-1,1}) {
+            const auto cushion_at=[&](float x,float z,Vec d) {
+                Hit hit;
+                return intersect({{x,cushion_nose_y,z},d},balls,2,eps,.051f,hit) && hit.mat==CushionCloth;
+            };
+            const float long_tip=table_nose_x-corner_jaw_setback;
+            const float end_tip=table_nose_z-corner_jaw_setback;
+            const Vec long_dir={0,0,float(side)},end_dir={float(end),0,0};
+            if(cushion_at(end*(side_mouth_half-.003f),side*.585f,long_dir) ||
+               !cushion_at(end*(side_mouth_half+.003f),side*.585f,long_dir) ||
+               cushion_at(end*(long_tip+.003f),side*.585f,long_dir) ||
+               !cushion_at(end*(long_tip-.003f),side*.585f,long_dir) ||
+               cushion_at(end*1.22f,side*(end_tip+.003f),end_dir) ||
+               !cushion_at(end*1.22f,side*(end_tip-.003f),end_dir)) {
+                std::fputs("The cushion tips do not define the side and corner pocket mouths.\n",stderr);
+                return 1;
+            }
+        }
 
         for(float offset:{-.001f,.001f}) {
             Hit joint;
@@ -306,7 +324,7 @@ int main() {
             }
         }
 
-        const Ray rising={{.075f,.051f,.625f},unit({0,.1f,1})};
+        const Ray rising={{.052f,.046f,.625f},unit({0,.1f,1})};
         const Vec inverse=invdir(rising.d);
         const float cut=(table_nose_z-rising.o.z)*inverse.z;
         Hit face;

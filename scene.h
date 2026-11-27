@@ -134,7 +134,7 @@ struct StaticScene {
         n[k].escape=nodes;
     }
 };
-constexpr float pocket_x=1.283f,pocket_z=.652f,bore=.069f;
+constexpr float pocket_x=1.283f,pocket_z=.652f,side_pocket_z=.688f,bore=.069f;
 constexpr float pocket_mouth_y=.049f,pocket_throat=.056f,pocket_bevel=.025f;
 constexpr float pocket_slope=(bore-pocket_throat)/pocket_bevel;
 constexpr float pocket_seam=pocket_mouth_y-pocket_bevel;
@@ -144,11 +144,13 @@ constexpr float pocket_floor_y=-.155f,pocket_floor_radius=.040f;
 constexpr float pocket_neck_y=-.030f,pocket_neck_radius=.047f;
 constexpr float pocket_lower_slope=(pocket_neck_radius-pocket_floor_radius)/(pocket_neck_y-pocket_floor_y);
 constexpr float pocket_upper_slope=(pocket_throat-pocket_neck_radius)/(pocket_seam-pocket_neck_y);
-constexpr float pocket_top=.056f,collar_bottom=.043f,collar_radius=.087f,collar_top_radius=.082f;
+constexpr float pocket_top=.050f,collar_bottom=.043f,collar_radius=.087f,collar_top_radius=.082f;
 constexpr float collar_slope=(collar_top_radius-collar_radius)/(pocket_top-collar_bottom);
 constexpr float rail_top=.048f,rail_half_width=.048f,rail_x=1.374f,rail_z=.739f;
 constexpr float table_nose_x=1.270f,table_nose_z=.635f;
 constexpr float cushion_nose_y=.635f*(2*radius),cushion_nose_round=.004f;
+constexpr float side_mouth_half=.064f,corner_jaw_setback=.082f;
+constexpr float cushion_bound_span=.642f;
 constexpr float table_clear_x=1.20f,table_clear_z=.55f;
 template<int LeafSize=3>
 ACG_HD constexpr StaticScene make_room() {
@@ -169,11 +171,12 @@ ACG_HD constexpr StaticScene make_room() {
         float qz=side*.667f,qx=side*1.302f;
         for(int half=-1;half<=1;half+=2) {
             float cx=half*.638f;
-            s.add({cx-.581f,0,qz-.032f},{cx+.581f,.046f,qz+.032f},CushionCloth,CushionX,side);
+            s.add({cx-cushion_bound_span,0,qz-.032f},
+                  {cx+cushion_bound_span,.046f,qz+.032f},CushionCloth,CushionX,side);
         }
-        s.add({qx-.032f,0,-.581f},{qx+.032f,.046f,.581f},CushionCloth,CushionZ,side);
+        s.add({qx-.032f,0,-cushion_bound_span},{qx+.032f,.046f,cushion_bound_span},CushionCloth,CushionZ,side);
         for(int k=-1;k<=1;++k) {
-            float cx=k*pocket_x,cz=side*pocket_z;
+            float cx=k*pocket_x,cz=side*(k?pocket_z:side_pocket_z);
             s.add({cx-collar_radius,pocket_floor_y,cz-collar_radius},
                   {cx+collar_radius,pocket_top,cz+collar_radius},Leather,Well);
         }
@@ -573,8 +576,11 @@ ACG_HD inline void intersect_ball_slot(const Balls& balls,Ray r,int slot,float t
 }
 
 ACG_HD inline float pocket_distance2(Vec v) {
-    float x=fabsf(v.x); x=x>pocket_x*.5f?x-pocket_x:x;
-    float z=fabsf(v.z)-pocket_z; return x*x+z*z;
+    float x=fabsf(v.x);
+    const bool corner=x>pocket_x*.5f;
+    if(corner) x-=pocket_x;
+    const float z=fabsf(v.z)-(corner?pocket_z:side_pocket_z);
+    return x*x+z*z;
 }
 ACG_HD inline float pocket_opening(float y) {
     if(y<pocket_neck_y)
@@ -751,12 +757,16 @@ ACG_HD inline void primitive(const Prim &p,Ray r,Vec inv,float t0,Hit &h) {
             // a second ray primitive. The supported front line stays fixed.
             if(!clip(s,r,-out+up*.38f,anchor,cushion_nose_round*.06977f) ||
                !clip(s,r,-out+up*1.18f,anchor,cushion_nose_round*.54674f) ||
-               !clip(s,r,-out-up*.56f,anchor,cushion_nose_round*.14612f)) return;
-            const float length=.5f*dot(b.b-b.a,along);
+               !clip(s,r,-out-up*.56f,anchor,cushion_nose_round*.14612f) ||
+               !clip(s,r,up-out*.17f,anchor,.0025f)) return;
             const bool plus_corner=!along_x || anchor.x>0;
             const bool minus_corner=!along_x || anchor.x<0;
-            if(!clip(s,r,along-out*(plus_corner?.77f:.25f),anchor,length-(plus_corner?.017f:.009f)) ||
-               !clip(s,r,-along-out*(minus_corner?.77f:.25f),anchor,length-(minus_corner?.017f:.009f))) return;
+            const float tip=(along_x?table_nose_x:table_nose_z)-corner_jaw_setback;
+            const float plus_tip=plus_corner?tip:-side_mouth_half;
+            const float minus_tip=minus_corner?-tip:side_mouth_half;
+            const float center=dot(anchor,along);
+            if(!clip(s,r,along-out*(plus_corner?1.28f:.25f),anchor,plus_tip-center) ||
+               !clip(s,r,-along-out*(minus_corner?1.28f:.25f),anchor,center-minus_tip)) return;
         }
     }
     for(int k=0;k<2;++k) {
@@ -787,7 +797,7 @@ constexpr Vec point_light_position={-.73f,1.54f,-.46f};
 // The central column between y=0 and the given height contains just the slate.
 // Its Z margin from either pocket row exceeds the largest pocket opening.
 constexpr bool clear_slate_column(float height) {
-    if(!(table_clear_z+collar_radius+eps<pocket_z)) return false;
+    if(!(table_clear_z+collar_radius+eps<lo(pocket_z,side_pocket_z))) return false;
     bool have_slate=false;
     for(int i=0;i<host_room.size;++i) {
         const Prim& p=host_room.p[i];
