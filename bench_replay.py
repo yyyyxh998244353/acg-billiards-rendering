@@ -17,7 +17,7 @@ def run(binary, mode, spacing, spp, args, folder):
     env = {k: v for k, v in os.environ.items()
            if k not in {'ACG_INTERPOLATE', 'ACG_TIMING_ONLY', 'ACG_BVH', 'ACG_SAMPLE_SEED',
                         'ACG_FELT_CACHE', 'ACG_FELT_LOCAL_SPP', 'ACG_LOCAL_SPP',
-                        'ACG_BACKGROUND_SPP', 'ACG_RANDOM_LIGHT', 'ACG_LOCAL_SOBOL'}}
+                        'ACG_BACKGROUND_SPP', 'ACG_RANDOM_LIGHT', 'ACG_LOCAL_SOBOL', 'ACG_RAIL_SOBOL'}}
     env['ACG_BVH'] = mode
     env['ACG_SAMPLE_SEED'] = str(args.reference_seed if folder.name == 'reference' else args.seed)
     if spacing:

@@ -47,6 +47,8 @@ ffmpeg -framerate 30 -i outputs/break-1080p/frame-%04d.ppm \
 
 球周仍为 144 spp；在上述成片配置加 `ACG_LOCAL_SOBOL=1`，仅在球周联合分层像素、面灯和首跳方向，不增加路径数。
 
+在同一配置加 `ACG_RAIL_SOBOL=1`，对库边、球袋及紧邻库边的台布也启用联合分层。库边仍使用 72 spp。
+
 ## 代码从哪里读
 
 - [`physics.py`](physics.py)：可重复的开球模拟，输出各帧的球心坐标。
