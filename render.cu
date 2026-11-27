@@ -1,6 +1,7 @@
 // CPU:  g++ -O3 -std=c++17 -x c++ render.cu -o render_cpu
 // H100: nvcc -O3 -std=c++17 -arch=sm_90 render.cu -o render
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <charconv>
 #include <chrono>
@@ -46,26 +47,86 @@ RENDER_HD inline u32 mix_bits(u32 v) {
     return v ^ (v >> 16);
 }
 
-RENDER_HD inline unsigned char display_byte(float linear) {
+struct RowSeed {
+    u32 sample_key, path_key;
+};
+
+RENDER_HD inline RowSeed row_seed(int y,u32 sample_seed) {
+    const auto row = static_cast<u32>(y);
+    return {mix_bits(sample_seed ^ row), acg_scene_detail::hash32(row + 0x243f6a88u)};
+}
+
+RENDER_HD inline float display_code(float t) {
+    const float s = t <= 0.0031308f ? 12.92f * t : 1.055f * powf(t, 1.0f / 2.4f) - 0.055f;
+    return 255.0f * s + 0.5f;
+}
+
+RENDER_HD inline unsigned char display_reference(float linear) {
     if (!(linear > 0.0f)) return 0;
     // Unit exposure, per-channel Reinhard, then the piecewise sRGB transfer.
     const float t = linear > 1.0f ? 1.0f - 1.0f / (1.0f + linear)
                                   : linear / (1.0f + linear);
-    const float s = t <= 0.0031308f ? 12.92f * t : 1.055f * powf(t, 1.0f / 2.4f) - 0.055f;
-    return static_cast<unsigned char>(255.0f * s + 0.5f);
+    return static_cast<unsigned char>(display_code(t));
 }
 
-RENDER_HD inline RGB8 render_pixel(int x,int y,int w,int h,int stage,int spp,const Balls* balls,unsigned poses,u32 sample_seed,float cached=-1) {
+#if defined(__APPLE__) && defined(ACG_PACKED_ROOM)
+constexpr u32 first_color_bits = 111u << 23; // 2^-16, below the first code boundary.
+constexpr u32 last_color_bits = 139u << 23; // 2^12, past the last code boundary.
+constexpr int color_shift = 14; // Keep the exponent and the top nine fraction bits.
+constexpr int color_bins = (last_color_bits - first_color_bits) >> color_shift;
+constexpr std::uint16_t uncertain_color = 256;
+
+inline float color_from_bits(u32 bits) {
+    float value;
+    std::memcpy(&value,&bits,sizeof(value));
+    return value;
+}
+
+const auto linear_colors = [] {
+    std::array<std::uint16_t,color_bins> table;
+    for (int i = 0; i < color_bins; ++i) {
+        const u32 start = first_color_bits + (static_cast<u32>(i) << color_shift);
+        const float lo = color_from_bits(start);
+        const float hi = color_from_bits(start + (1u << color_shift) - 1);
+        // Bound the quotient with independent numerator and denominator bounds.
+        // The upper Reinhard branch is monotone under rounded float arithmetic.
+        const float low_code = display_code(lo < 1.f ? lo / (1.f + hi) : 1.f - 1.f / (1.f + lo));
+        const float high_code = display_code(lo < 1.f ? hi / (1.f + lo) : 1.f - 1.f / (1.f + hi));
+        const auto code = static_cast<std::uint16_t>(low_code);
+        // Leave room for libm rounding and the slight discontinuity at the sRGB knee.
+        constexpr float margin = 0x1p-10f; // In byte units.
+        table[i] = low_code > code + margin && high_code < code + 1 - margin ? code : uncertain_color;
+    }
+    return table;
+}();
+#endif
+
+RENDER_HD inline unsigned char display_byte(float linear) {
+#if defined(__APPLE__) && defined(ACG_PACKED_ROOM)
+    u32 bits;
+    std::memcpy(&bits,&linear,sizeof(bits));
+    // The unsigned range check also sends negative and nonfinite values to the formula.
+    const u32 index = (bits - first_color_bits) >> color_shift;
+    if (index < static_cast<u32>(color_bins)) {
+        const auto code = linear_colors[index];
+        if (code != uncertain_color) return static_cast<unsigned char>(code);
+    }
+#endif
+    return display_reference(linear);
+}
+
+RENDER_HD inline RGB8 render_pixel(int x,int y,int w,int h,int stage,int spp,const Balls* balls,unsigned poses,RowSeed row,float cached) {
     // No dependency on launch order, stage, spp budget or time. Matching pixels
     // share the same prefix of random samples in all comparison renders.
-    const u32 pixel_key = mix_bits(sample_seed ^ static_cast<u32>(y)) ^ static_cast<u32>(x);
-    const u32 first = mix_bits(pixel_key);
+    using namespace acg_scene_detail;
+    const auto column = static_cast<u32>(x);
+    const u32 first = mix_bits(row.sample_key ^ column);
+    const u32 path_key = row.path_key ^ hash32(column + 0x9e3779b9u);
     float r = 0, g = 0, b = 0;
     for (int s = 0; s < spp; ++s) {
         const u32 seed = mix_bits(first + static_cast<u32>(s));
         const unsigned pose = (static_cast<std::uint64_t>(mix_bits(seed ^ 0xba7c19u)) * poses) >> 32;
-        using namespace acg_scene_detail;
-        Rng rng={hash32((seed?seed:base_seed)^hash32(u32(x)+0x9e3779b9u)^hash32(u32(y)+0x243f6a88u))};
+        Rng rng={hash32((seed?seed:base_seed)^path_key)};
         const Ray ray=camera(x,y,w,h,stage,rng);
         const Vec v=trace(ray,balls[pose],stage,0.f,rng,analytic_shadow,cached);
         r += v.x; g += v.y; b += v.z;
@@ -77,8 +138,10 @@ RENDER_HD inline RGB8 render_pixel(int x,int y,int w,int h,int stage,int spp,con
 #ifdef __CUDACC__
 __global__ void render_pixels(RGB8* pixels,size_t count,int w,int h,int stage,int spp,const Balls* device_balls,unsigned poses,u32 sample_seed,const float* cache) {
     const size_t stride = static_cast<size_t>(blockDim.x) * gridDim.x;
-    for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < count; i += stride)
-        pixels[i] = render_pixel(static_cast<int>(i % w),static_cast<int>(i / w),w,h,stage,spp,device_balls,poses,sample_seed,cache?cache[i]:-1.f);
+    for (size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < count; i += stride) {
+        const int x = static_cast<int>(i % w), y = static_cast<int>(i / w);
+        pixels[i] = render_pixel(x,y,w,h,stage,spp,device_balls,poses,row_seed(y,sample_seed),cache?cache[i]:-1.f);
+    }
 }
 
 void check(cudaError_t e, const char* operation) {
@@ -103,6 +166,44 @@ float scene_time(const char* text) {
     if (errno == ERANGE || end == text || *end != '\0' || !std::isfinite(v))
         throw std::invalid_argument(std::string("invalid time: ") + text);
     return v;
+}
+
+struct Receiver : acg_interpolate::Guide { Vec point; };
+
+constexpr Vec guide_direction={0,-1,0};
+constexpr float contact_distance=.13f;
+static_assert(2*acg_scene_detail::radius*acg_scene_detail::radius < contact_distance*contact_distance);
+
+// The guide point lies on y=0. place_balls() fixes every center at y=radius.
+inline Receiver probe_receiver(Vec point,const Balls& balls,const acg_scene_detail::Box& contact_bounds,
+                               Vec inverse,int stage) {
+    using namespace acg_scene_detail;
+    Receiver guide{};
+    guide.point=point;
+    // The contact check also excludes every possible ball hit on this ray.
+    if(point.x>=contact_bounds.a.x && point.x<=contact_bounds.b.x &&
+       point.z>=contact_bounds.a.z && point.z<=contact_bounds.b.z) {
+        for(const Vec center:balls.c) {
+            const Vec offset=point-center;
+            if(dot(offset,offset)<contact_distance*contact_distance) return guide;
+        }
+    }
+    float depth=camera_height;
+    if(!(overhead_slate_clear && fabsf(point.x)<table_clear_x && fabsf(point.z)<table_clear_z)) {
+        const Ray ray={point+Vec{0,camera_height,0},guide_direction};
+        // Farther hits cannot pass the receiver height check.
+        constexpr float limit=camera_height+2*eps;
+#if !defined(__CUDA_ARCH__)
+        const bool interior=inside_room(ray.o,inverse,limit);
+#else
+        constexpr bool interior=false;
+#endif
+        Hit hit;
+        if(!intersect_with_inverse(ray,inverse,balls,stage,eps,limit,hit,interior) ||
+           hit.mat!=Felt || hit.normal.y!=1 || fabsf(hit.t-camera_height)>eps) return guide;
+        depth=hit.t;
+    }
+    return {{true,0,Felt,depth,{0,1,0}},point};
 }
 
 double elapsed_ms(Clock::time_point start) {
@@ -163,10 +264,18 @@ int main(int argc, char** argv) try {
     if(query && !use_tree && std::strcmp(query,"scan")!=0)
         throw std::runtime_error("ACG_BVH must be scan, rebuild or refit");
     Balls prepared[64];
+#ifdef ACG_PACKED_ROOM
+    acg_scene_detail::PackedBalls packed_balls[64];
+#endif
     for(unsigned i=0;i<poses;++i) {
         auto& state=prepared[i];
         place_balls(state,time,balls+32*i);
-        if(!use_tree) continue;
+        if(!use_tree) {
+#ifdef ACG_PACKED_ROOM
+            acg_scene_detail::prepare_packed_balls(state,packed_balls[i]);
+#endif
+            continue;
+        }
         if((i || frame) && std::strcmp(query,"refit")==0) {
             trees[i]=i?trees[i-1]:prior;
             refit_ball_bvh(trees[i],state);
@@ -180,35 +289,23 @@ int main(int argc, char** argv) try {
     if(const char* setting=std::getenv("ACG_INTERPOLATE"); setting && poses==1) {
         using namespace acg_scene_detail;
         using namespace acg_interpolate;
-        Balls state;
-        place_balls(state,time,balls);
-        state.tree=use_tree?trees:nullptr;
+        const Balls& state=prepared[0];
         Settings config;
         config.spacing=integer(setting,1,64,"interpolation grid spacing");
         cache.assign(count,-1.f);
-        struct Receiver : Guide { Vec point; };
-        auto guide=[&](int x,int y) {
-            Receiver g{};
-            float a=float(w)/h, v=hi(.77f,1.40f/a);
-            g.point={(2*(x+.5f)/w-1)*a*v,0,(2*(y+.5f)/h-1)*v};
-            constexpr float height=light_y-.12f;
-            Hit hit;
-            if(!intersect({g.point+Vec{0,height,0},{0,-1,0}},state,stage,eps,far_t,hit) ||
-               hit.mat!=Felt || hit.normal.y!=1 || fabsf(hit.t-height)>eps) return g;
-            // Exclude contacts and their nearby projected point-light shadows.
-            for(const auto& c:state.c)
-                if(dot(g.point-c,g.point-c)<.13f*.13f) return g;
-            g.smooth_diffuse=true; g.object=0; g.material=Felt; g.depth=hit.t; g.normal={0,1,0};
-            return g;
+        const float aspect=float(w)/h, half_height=hi(.77f,1.40f/aspect);
+        const Vec guide_inverse=invdir(guide_direction);
+        const Box contact_bounds={state.box.a-grey(contact_distance),state.box.b+grey(contact_distance)};
+        auto guide=[&](int x,int y) noexcept {
+            const Vec point={(2*(x+.5f)/w-1)*aspect*half_height,0,(2*(y+.5f)/h-1)*half_height};
+            return probe_receiver(point,state,contact_bounds,guide_inverse,stage);
         };
-        auto exact=[&](int,int,const Receiver& g) -> RGB {
-            if(!g.smooth_diffuse) return {};
-            Vec p=g.point+Vec{0,eps,0}, d=Vec{-.73f,1.54f,-.46f}-p;
-            float l=sqrtf(dot(d,d)), value=visibility({p,d*(1/l)},l-3*eps,state,stage);
-            return {value,value,value};
+        auto exact=[&](int,int,const Receiver& g) noexcept {
+            if(!g.smooth_diffuse) return 0.f;
+            return visibility_to_light(g.point+Vec{0,eps,0},point_light_position,state,stage);
         };
-        const auto stat=fixed_grid(w,h,config,guide,exact,[&](int x,int y,const Receiver&,RGB value,Source source) {
-            if(source==Source::interpolated) cache[size_t(y)*w+x]=value[0];
+        const auto stat=fixed_grid<false,true>(w,h,config,guide,exact,[&](int x,int y,const Receiver&,float value,Source) noexcept {
+            cache[size_t(y)*w+x]=value;
         });
         std::cerr << "interpolated=" << stat.interpolated << " pixels=" << count
                   << " cache_ms=" << elapsed_ms(cache_start) << '\n';
@@ -245,13 +342,20 @@ int main(int argc, char** argv) try {
 #ifdef ACG_COUNT_TRAVERSAL
     acg_scene_detail::ball_counters={};
 #endif
+    RGB8* const pixels = image.get();
+    const float* const shadow_cache = cache.empty()?nullptr:cache.data();
 #ifdef _OPENMP
-    #pragma omp parallel for schedule(dynamic, 4)
+    // Shrink chunks near the end to balance expensive rows across workers.
+    #pragma omp parallel for schedule(guided, 1)
 #endif
-    for (int y = 0; y < h; ++y)
+    for (int y = 0; y < h; ++y) {
+        const size_t offset = static_cast<size_t>(y) * w;
+        RGB8* const row = pixels + offset;
+        const float* const shadows = shadow_cache?shadow_cache + offset:nullptr;
+        const RowSeed seed = row_seed(y,sample_seed);
         for (int x = 0; x < w; ++x)
-            image[static_cast<size_t>(y) * w + x] = render_pixel(x,y,w,h,stage,spp,prepared,poses,sample_seed,
-                                                               cache.empty()?-1.f:cache[size_t(y)*w+x]);
+            row[x] = render_pixel(x,y,w,h,stage,spp,prepared,poses,seed,shadows?shadows[x]:-1.f);
+    }
     const double render_ms = elapsed_ms(render_start), d2h_ms = 0.0;
 #ifdef ACG_COUNT_TRAVERSAL
     const auto& counters=acg_scene_detail::ball_counters;

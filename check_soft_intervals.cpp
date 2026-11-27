@@ -72,14 +72,100 @@ int main() {
         const float d2=dot(delta,delta);
         const Vec wi=unit(delta);
         float pdf;
-        const Vec f=brdf(m,n,n,wi,pdf);
+        const BrdfView view=prepare_brdf_view(m,n,n);
+        const Vec f=brdf(m,n,n,wi,view,pdf);
         const Vec expected=f*emission()*(wi.y*wi.y*light_area/(d2*area_samples));
-        const Vec terminal=direct_sample(p,n,n,q,emission(),true,m,balls,2,1,false);
-        if(fabsf(terminal.x-expected.x)>1e-6f || fabsf(terminal.y-expected.y)>1e-6f ||
-           fabsf(terminal.z-expected.z)>1e-6f) {
+        const Vec terminal=direct_sample(p,n,n,p+n*eps,q,emission(),true,m,view,balls,2,1,false);
+        const auto close=[](double actual,double reference) { return fabs(actual-reference)<=1e-6; };
+        if(!close(terminal.x,expected.x) || !close(terminal.y,expected.y) ||
+           !close(terminal.z,expected.z)) {
             std::fputs("Terminal area sample lost unopposed light energy\n",stderr);
             return 1;
         }
+
+        // At unit GGX roughness with wi=n, D=1/pi and G1(wi)=1. The
+        // specular term divided by Fresnel and the specular PDF then coincide.
+        struct Lobes { float diffuse, f0, probability; };
+        const Lobes lobes[]={{.3f,0,0},{.3f,.02f,.16f},{.3f,.2f,.4f},{.01f,.2f,.8f},{0,.2f,1}};
+        for(const Lobes lobe:lobes) for(float grazing:{0.f,0x1p-16f}) {
+            const Material surface={grey(lobe.diffuse),grey(lobe.f0),1};
+            const Vec wo=unit({1,grazing,0});
+            float density;
+            const Vec value=brdf(surface,n,wo,n,prepare_brdf_view(surface,n,wo),density);
+            const double cosine=wo.y;
+            const double specular=1/(2*pi*(1+cosine));
+            const double fresnel_ref=lobe.f0==0?0:
+                lobe.f0+(1-lobe.f0)*pow(1-sqrt((1+cosine)*.5),5);
+            const double value_ref=cosine==0?0:
+                (1-fresnel_ref)*lobe.diffuse/pi+fresnel_ref*specular;
+            const double density_ref=cosine==0?0:(1-lobe.probability)/pi+lobe.probability*specular;
+            if(!close(value.x,value_ref) || !close(value.y,value_ref) ||
+               !close(value.z,value_ref) || !close(density,density_ref)) {
+                std::fputs("Grazing BRDF value or mixture PDF differs from the GGX reference\n",stderr);
+                return 1;
+            }
+        }
+
+        const Vec lit={q.x,light_y-.75f,q.z};
+        const Material mixed={grey(.3f),grey(.2f),1};
+        const double distance=q.y-lit.y, light_pdf=distance*distance/light_area;
+        const double bsdf_pdf=.6/pi+.4/(4*pi);
+        const double weighted_pdf=area_samples*light_pdf;
+        const double mis=weighted_pdf*weighted_pdf/(weighted_pdf*weighted_pdf+bsdf_pdf*bsdf_pdf);
+        const double scale=(.8*.3/pi+.2/(4*pi))*mis/weighted_pdf;
+        const Vec competing=direct_sample(lit,n,n,lit+n*eps,q,emission(),true,mixed,
+                                          prepare_brdf_view(mixed,n,n),balls,2,-1.f,true);
+        if(!close(competing.x,emission().x*scale) || !close(competing.y,emission().y*scale) ||
+           !close(competing.z,emission().z*scale)) {
+            std::fputs("Uncached area sample differs from the competing light estimate\n",stderr);
+            return 1;
+        }
     }
-    std::puts("72 quadrature slices plus full blockage and plane tangency passed.");
+    {
+        Balls balls{};
+        float positions[32];
+        for(auto& position:positions) position=3;
+        place_balls(balls,0,positions);
+        const Vec above_slate={0,eps,0};
+        const Vec below_slate={0,-.05f,0};
+        const Vec below_emitter={0,light_y-.1f,light_z};
+        const Vec above_emitter={0,light_y+.1f,light_z};
+        const Vec column_below={0,below_emitter.y,point_light_position.z};
+        const Vec column_above={0,above_emitter.y,point_light_position.z};
+        const float column_visibility=fabsf(point_light_position.z-light_z)<light_hz?0.f:1.f;
+        if(visibility_to_light(above_slate,point_light_position,balls,1)!=1 ||
+           visibility_to_light(below_slate,point_light_position,balls,1)!=0 ||
+           visibility_to_light(below_emitter,above_emitter,balls,2)!=0 ||
+           visibility_to_light(column_below,column_above,balls,2)!=column_visibility) {
+            std::fputs("Point shadow changed slate or emitter occlusion.\n",stderr);
+            return 1;
+        }
+        positions[0]=positions[1]=0;
+        place_balls(balls,0,positions);
+        const auto ball_cutoffs_match=[&] {
+            const float near=2*radius-eps, far=2*radius+3*eps;
+            const Vec center={0,radius,0};
+            const float inside=nextafterf(near,0), outside=nextafterf(near,1);
+            // A dyadic step keeps these short rays vertical with unit direction.
+            return visibility_to_light({0,inside,0},{0,inside+0x1p-8f,0},balls,1)==0 &&
+                   visibility_to_light({0,outside,0},{0,outside+0x1p-8f,0},balls,1)==1 &&
+                   visibility_to_light(center,{0,nextafterf(far,0),0},balls,1)==1 &&
+                   visibility_to_light(center,{0,nextafterf(far,1),0},balls,1)==0;
+        };
+        bool match=ball_cutoffs_match();
+#ifdef ACG_PACKED_ROOM
+        PackedBalls packed;
+        prepare_packed_balls(balls,packed);
+        match=ball_cutoffs_match() && match;
+#endif
+        BallBVH tree;
+        build_ball_bvh(tree,balls);
+        balls.tree=&tree;
+        if(!ball_cutoffs_match() || !match) {
+            std::fputs("Point shadow changed the ball hit interval.\n",stderr);
+            return 1;
+        }
+    }
+    std::puts("Point shadow ball, slate and emitter occlusion passed.");
+    std::puts("72 quadrature slices, blockage, tangency, grazing BRDF and area-light weights passed.");
 }

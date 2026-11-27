@@ -70,6 +70,7 @@ inline void refit_ball_bvh(BallBVH &tree,const Balls &balls) {
 
 // inv=invdir(r.d); r.d is unit length as required by sphere_t. Return true
 // only for a ball strictly inside (t0, h.t); leave all of h alone on miss.
+template<bool NeedNormal=true>
 ACG_HD inline bool intersect_ball_bvh(const BallBVH &tree,const Balls &balls,Ray r,Vec inv,
                                       float t0,Hit &h) {
     const float limit=h.t;
@@ -94,7 +95,7 @@ ACG_HD inline bool intersect_ball_bvh(const BallBVH &tree,const Balls &balls,Ray
         ++i;
     }
     if(slot==BallBVH::slot_count) return false;
-    record(h,best,unit((r.o-balls.c[slot])+r.d*best),Ball,slot);
+    record(h,best,NeedNormal?unit((r.o-balls.c[slot])+r.d*best):Vec{},Ball,slot);
     return true;
 }
 
