@@ -135,6 +135,7 @@ struct StaticScene {
     }
 };
 constexpr float pocket_x=1.283f,pocket_z=.652f,side_pocket_z=.688f,bore=.069f;
+constexpr float side_pocket_shear=.35f;
 constexpr float pocket_mouth_y=.049f,pocket_throat=.056f,pocket_bevel=.025f;
 constexpr float pocket_slope=(bore-pocket_throat)/pocket_bevel;
 constexpr float pocket_seam=pocket_mouth_y-pocket_bevel;
@@ -177,8 +178,9 @@ ACG_HD constexpr StaticScene make_room() {
         s.add({qx-.032f,0,-cushion_bound_span},{qx+.032f,.046f,cushion_bound_span},CushionCloth,CushionZ,side);
         for(int k=-1;k<=1;++k) {
             float cx=k*pocket_x,cz=side*(k?pocket_z:side_pocket_z);
-            s.add({cx-collar_radius,pocket_floor_y,cz-collar_radius},
-                  {cx+collar_radius,pocket_top,cz+collar_radius},Leather,Well);
+            const float outward=k?0.f:side_pocket_shear*pocket_top;
+            s.add({cx-collar_radius,pocket_floor_y,cz-collar_radius-(side<0?outward:0.f)},
+                  {cx+collar_radius,pocket_top,cz+collar_radius+(side>0?outward:0.f)},Leather,Well);
         }
     }
     // Keep the transmissive reference object out of the primary table image.
@@ -579,7 +581,7 @@ ACG_HD inline float pocket_distance2(Vec v) {
     float x=fabsf(v.x);
     const bool corner=x>pocket_x*.5f;
     if(corner) x-=pocket_x;
-    const float z=fabsf(v.z)-(corner?pocket_z:side_pocket_z);
+    const float z=fabsf(v.z)-(corner?pocket_z:side_pocket_z+side_pocket_shear*hi(0.f,v.y));
     return x*x+z*z;
 }
 ACG_HD inline float pocket_opening(float y) {
@@ -654,10 +656,14 @@ ACG_HD inline void primitive(const Prim &p,Ray r,Vec inv,float t0,Hit &h) {
     if(!box_span(b,r,inv,t0,h.t,s)) return;
 #endif
     if(p.shape==Well) {
-        const Vec c=(b.a+b.b)*.5f,v=r.o-c;
-        const float side=c.z>0?1.f:-1.f;
-        const bool corner=fabsf(c.x)>pocket_x*.5f;
-        const float end_side=c.x>0?1.f:-1.f;
+        const float x=(b.a.x+b.b.x)*.5f,side=b.b.z>0?1.f:-1.f;
+        const bool corner=fabsf(x)>pocket_x*.5f;
+        const Vec c={x,0,side*(corner?pocket_z:side_pocket_z)},v=r.o-c;
+        const float end_side=x>0?1.f:-1.f,shear=corner?0.f:side*side_pocket_shear;
+        const auto radial2=[&](Vec local,float y) {
+            const float z=local.z-shear*y;
+            return local.x*local.x+z*z;
+        };
         const auto on_rail_side=[&](Vec point) {
             return side*point.z>=table_nose_z || (corner && end_side*point.x>=table_nose_x);
         };
@@ -668,8 +674,7 @@ ACG_HD inline void primitive(const Prim &p,Ray r,Vec inv,float t0,Hit &h) {
             const float t=(y-r.o.y)*inv.y;
             if(t<=t0 || t>=h.t) continue;
             if(!on_rail_side(r.o+r.d*t)) continue;
-            const Vec local=v+r.d*t;
-            const float r2=local.x*local.x+local.z*local.z;
+            const float r2=radial2(v+r.d*t,y);
             const float inner=pocket_opening(y),outer=face?collar_top_radius:collar_radius;
             if(r2>=inner*inner && r2<=outer*outer)
                 record(h,t,NeedNormal?Vec{0,face?1.f:-1.f,0}:Vec{},PocketTrim);
@@ -684,8 +689,7 @@ ACG_HD inline void primitive(const Prim &p,Ray r,Vec inv,float t0,Hit &h) {
             const Vec point=r.o+r.d*t;
             if(point.y<collar_bottom || point.y>pocket_top) continue;
             if(k==0 ? side*point.z>=table_nose_z : corner && end_side*point.x>table_nose_x) continue;
-            const Vec local=v+r.d*t;
-            const float r2=local.x*local.x+local.z*local.z;
+            const float r2=radial2(v+r.d*t,point.y);
             const float inner=pocket_opening(point.y),outer=collar_outer(point.y);
             if(r2>=inner*inner && r2<=outer*outer)
                 record(h,t,NeedNormal?basis_axis(k,-sign):Vec{},PocketTrim);
@@ -696,19 +700,22 @@ ACG_HD inline void primitive(const Prim &p,Ray r,Vec inv,float t0,Hit &h) {
             if(p.x*p.x+p.z*p.z<=pocket_floor_radius*pocket_floor_radius)
                 record(h,bottom,NeedNormal?Vec{0,1,0}:Vec{},Ebony);
         }
-        // Three connected tapers below the collar, then its inner and outer returns.
-        for(int part=0;part<5;++part) {
-            const bool outer=part==4,raised=part>=3;
+        // Split at the bed plane: above it the side mouth leans out of the
+        // playing surface. This is a sheared conic, still a quadratic ray hit.
+        for(int part=0;part<6;++part) {
+            const bool outer=part==5,raised=part>=4;
             const float y0=outer?collar_bottom:(raised?pocket_mouth_y:
-                (part==2?pocket_seam:(part==1?pocket_neck_y:pocket_floor_y)));
-            const float y1=raised?pocket_top:(part==2?pocket_mouth_y:(part==1?pocket_seam:pocket_neck_y));
+                (part==3?pocket_seam:(part==2?0.f:(part==1?pocket_neck_y:pocket_floor_y))));
+            const float y1=raised?pocket_top:(part==3?pocket_mouth_y:
+                (part==2?pocket_seam:(part==1?0.f:pocket_neck_y)));
             const float k=outer?collar_slope:(raised?0.f:
-                (part==2?pocket_slope:(part==1?pocket_upper_slope:pocket_lower_slope)));
+                (part==3?pocket_slope:(part>=1?pocket_upper_slope:pocket_lower_slope)));
             const float section_radius=outer?collar_radius:pocket_opening(y0);
             const float r0=section_radius+k*(r.o.y-y0),rd=k*r.d.y;
-            float a=r.d.x*r.d.x+r.d.z*r.d.z-rd*rd;
-            float beta=v.x*r.d.x+v.z*r.d.z-r0*rd;
-            float cc=v.x*v.x+v.z*v.z-r0*r0;
+            const float sk=y0>=0?shear:0.f,z0=v.z-sk*r.o.y,dz=r.d.z-sk*r.d.y;
+            const float a=r.d.x*r.d.x+dz*dz-rd*rd;
+            const float beta=v.x*r.d.x+z0*dz-r0*rd;
+            const float cc=v.x*v.x+z0*z0-r0*r0;
             float det=beta*beta-a*cc;
             if(det<0) continue;
             const float q=-beta-copysignf(sqrtf(det),beta);
@@ -717,9 +724,9 @@ ACG_HD inline void primitive(const Prim &p,Ray r,Vec inv,float t0,Hit &h) {
                 if((linear && (j || fabsf(beta)<1.e-9f)) || (j && q==0)) continue;
                 float t=linear?-cc/(2*beta):(j?cc/q:q/a);
                 if(t<=t0 || t>=h.t) continue;
-                Vec p=v+r.d*t; float y=r.o.y+r.d.y*t;
+                const float px=v.x+r.d.x*t,pz=z0+dz*t,y=r.o.y+r.d.y*t;
                 if(y>=y0 && y<=y1 && (!raised || on_rail_side(r.o+r.d*t))) {
-                    const Vec outside={p.x,-k*(section_radius+k*(y-y0)),p.z};
+                    const Vec outside={px,-k*(section_radius+k*(y-y0))-sk*pz,pz};
                     record(h,t,NeedNormal?unit(outer?outside:-outside):Vec{},
                            raised?PocketTrim:Leather);
                 }
@@ -788,9 +795,9 @@ ACG_HD inline void primitive(const Prim &p,Ray r,Vec inv,float t0,Hit &h) {
 }
 
 #ifndef ACG_LIGHT_HALF_WIDTH
-#define ACG_LIGHT_HALF_WIDTH .215f
+#define ACG_LIGHT_HALF_WIDTH .30f
 #endif
-constexpr float light_y=1.37f,light_z=-1.08f,light_hx=.79f,light_hz=ACG_LIGHT_HALF_WIDTH;
+constexpr float light_y=1.37f,light_z=-.52f,light_hx=.79f,light_hz=ACG_LIGHT_HALF_WIDTH;
 constexpr float camera_height=light_y-.12f;
 constexpr Vec point_light_position={-.73f,1.54f,-.46f};
 
@@ -816,7 +823,7 @@ constexpr bool clear_slate_column(float height) {
 static constexpr bool overhead_slate_clear=clear_slate_column(camera_height);
 static_assert(light_hz>0,"Emitter half width must be positive");
 constexpr float light_area=4*light_hx*light_hz;
-ACG_HD constexpr Vec emission() { return {12.0f,10.9f,9.4f}; }
+ACG_HD constexpr Vec emission() { return {6.7f,6.1f,5.3f}; }
 #include "soft_intervals.h"
 struct ScalarSlabs {
     Ray ray;
@@ -880,6 +887,14 @@ ACG_HD inline void intersect_balls(Ray r,Vec inv,const Balls &balls,float t0,Hit
     }
 }
 
+ACG_HD inline float emitter_hit(Ray r,float inverse_y,float t0,float t1) {
+    if(fabsf(r.d.y)<=1.e-12f) return t1;
+    const float t=(light_y-r.o.y)*inverse_y;
+    if(!(t>t0 && t<t1)) return t1;
+    const Vec p=r.o+r.d*t;
+    return fabsf(p.x)<light_hx && fabsf(p.z-light_z)<light_hz?t:t1;
+}
+
 // Visibility needs the same nearest hit and material, but never reads its normal.
 template<bool NeedNormal=true>
 ACG_HD inline bool intersect_with_inverse(Ray r,Vec inv,const Balls &balls,int stage,float t0,float t1,
@@ -912,13 +927,9 @@ ACG_HD inline bool intersect_with_inverse(Ray r,Vec inv,const Balls &balls,int s
 #else
     intersect_static<NeedNormal>(s.p,s.n,s.nodes,r,inv,stage,t0,h,ScalarSlabs{r,inv,t0});
 #endif
-    if(stage==2 && fabsf(r.d.y)>1.e-12f) {
-        float t=(light_y-r.o.y)*inv.y;
-        if(t>t0 && t<h.t) {
-            Vec p=r.o+r.d*t;
-            if(fabsf(p.x)<light_hx && fabsf(p.z-light_z)<light_hz)
-                record(h,t,NeedNormal?Vec{0,-1,0}:Vec{},Lamp);
-        }
+    if(stage==2) {
+        const float t=emitter_hit(r,inv.y,t0,h.t);
+        if(t<h.t) record(h,t,NeedNormal?Vec{0,-1,0}:Vec{},Lamp);
     }
     return h.t<t1;
 }
@@ -1018,25 +1029,6 @@ ACG_HD inline bool digit(int n,float u,float v) {
     int x=int(floorf(u)),y=int(floorf(v));
     return x>=0 && x<3 && y>=0 && y<5 && ((glyph(n)>>(14-3*y-x))&1u);
 }
-ACG_HD inline float digit_area(int n,float u,float v,float du,float dv) {
-    if(du<=1.e-6f || dv<=1.e-6f) return float(digit(n,u,v));
-    const float x0=u-du,x1=u+du,y0=v-dv,y1=v+dv;
-    const int left=int(hi(0,floorf(x0))),right=int(lo(2,floorf(x1)));
-    const int top=int(hi(0,floorf(y0))),bottom=int(lo(4,floorf(y1)));
-    const unsigned bits=glyph(n);
-    float covered=0;
-    for(int y=top;y<=bottom;++y) {
-        const float height=lo(y1,float(y+1))-hi(y0,float(y));
-        for(int x=left;x<=right;++x)
-            if((bits>>(14-3*y-x))&1u)
-                covered+=height*(lo(x1,float(x+1))-hi(x0,float(x)));
-    }
-    return clamp(covered/(4*du*dv),0,1);
-}
-ACG_HD constexpr float texture_coverage(float signed_distance,float halfwidth) {
-    if(halfwidth<=0) return signed_distance>0?1.f:0.f;
-    return clamp(.5f+.5f*signed_distance/halfwidth,0,1);
-}
 ACG_HD inline Vec unroll(Vec v,Vec delta) {
     float dist=sqrtf(delta.x*delta.x+delta.z*delta.z);
     return dist<eps?v:rotate(v,{delta.z/dist,0,-delta.x/dist},-dist/radius);
@@ -1055,30 +1047,29 @@ ACG_HD inline Vec ball_local(Vec n,int slot,Vec center,float t) {
     n=rotate(n,{0,1,0},-.38f+.41f*sinf(3.7f*slot));
     return rotate(n,{1,0,0},.61f+.13f*sinf(1.91f*slot));
 }
-ACG_HD inline Vec enamel(int num,Vec n,Vec body,float footprint=0) {
-    if(num==0) {
-        const float dominant=hi(fabsf(n.x),hi(fabsf(n.y),fabsf(n.z)));
-        return mix(body,{.48f,.046f,.041f},texture_coverage(dominant-.994f,.11f*footprint));
-    }
+ACG_HD inline Vec enamel(int num,Vec n,Vec body) {
+    if(num==0)
+        return hi(fabsf(n.x),hi(fabsf(n.y),fabsf(n.z)))>.994f?Vec{.48f,.046f,.041f}:body;
     // Longitude/latitude charts give two antipodal number badges and the belt.
     float lon=atan2f(n.x,n.z),lat=asinf(clamp(n.y,-1,1));
     if(lon>pi*.5f) lon-=pi; if(lon<-pi*.5f) lon+=pi;
     Vec ivory={.90f,.835f,.686f};
-    Vec c=num>8?mix(body,ivory,texture_coverage(fabsf(lat)-.49f,footprint)):body;
-    const float arc=footprint/hi(.25f,sqrtf(hi(0,1-n.y*n.y)));
-    const float edge=.45f+arc,rr=lon*lon+lat*lat;
-    if(rr<edge*edge) {
-        const float r=sqrtf(rr);
-        const float outer=texture_coverage(.45f-r,arc),inner=texture_coverage(.412f-r,arc);
-        // Weighted disjoint badge regions: the thin rim is the difference
-        // of the two disk coverages, not another binary texture layer.
-        const float u=lon/.092f,v=2.5f-lat/.095f,du=arc/.092f,dv=footprint/.095f;
-        const float ink=num<10?digit_area(num,u+1.5f,v,du,dv):
-            digit_area(1,u+3.35f,v,du,dv)+digit_area(num%10,u-.35f,v,du,dv);
-        const Vec badge=mix(ivory,{.013f,.017f,.022f},clamp(ink,0,1));
-        c=c*(1-outer)+mix(body,grey(.025f),.48f)*(outer-inner)+badge*inner;
+    Vec c=num>8 && fabsf(lat)>.49f?ivory:body;
+    const float rr=lon*lon+lat*lat;
+    if(rr<.45f*.45f) {
+        c=rr>.412f*.412f?mix(body,grey(.025f),.48f):ivory;
+        const float u=lon/.092f,v=2.5f-lat/.095f;
+        const bool ink=num<10?digit(num,u+1.5f,v):(digit(1,u+3.35f,v)||digit(num%10,u-.35f,v));
+        if(ink) c={.013f,.017f,.022f};
     }
     return c;
+}
+
+ACG_HD inline float marble_vein(float phase,float footprint) {
+    float vein=1-fabsf(sinf(phase));
+    vein*=vein; vein*=vein; vein*=vein;
+    constexpr float mean=.0714212f; // Integral of (1 - |sin(x)|)^8 over one period.
+    return mean+(vein-mean)*texture_band(68*footprint);
 }
 
 struct Material { Vec diffuse,f0; float rough; };
@@ -1107,15 +1098,13 @@ ACG_HD inline Material material(Hit h,Vec p,const Balls &balls,float t,int stage
             }
             if(num==4) { // Veined marble, evaluated in ball-local coordinates.
                 float bend=.21f*sinf(8*n.z)+.09f*sinf(19*n.x+11*n.z);
-                float vein=1-fabsf(sinf(13*(n.y+bend)));
-                vein*=vein; vein*=vein; vein*=vein;
-                vein=.18f+(vein-.18f)*texture_band(68*footprint);
+                const float vein=marble_vein(13*(n.y+bend),footprint);
                 base=mix({.76f,.73f,.66f},{.14f,.18f,.23f},vein); rough=.23f;
             } else if(num==6) { // Layered ceramic glaze with mottled pigment.
                 float mottling=.5f+.5f*sinf(17*n.x+3*sinf(13*n.z))*sinf(19*n.y);
                 base=mix({.016f,.085f,.19f},{.16f,.58f,.66f},mottling); rough=.18f;
             } else if(num==7) { // Keep weave only where the projected thread pitch resolves.
-                constexpr Vec average={.277f,.147f,.0745f};
+                constexpr Vec average={.27675f,.1465f,.0745f};
                 const float band=texture_band(48*footprint/hi(.18f,sqrtf(hi(0,1-n.y*n.y))));
                 base=average;
                 if(band>0) {
@@ -1128,7 +1117,8 @@ ACG_HD inline Material material(Hit h,Vec p,const Balls &balls,float t,int stage
                 }
                 rough=.46f;
             }
-            return varnish(enamel(num,n,base,footprint),rough);
+            // Camera samples already integrate these sharp graphic marks.
+            return varnish(enamel(num,n,base),rough);
         }
         case Felt: {
             const float tone=cloth_finish(p.x,p.z);
@@ -1283,10 +1273,7 @@ ACG_HD inline float visibility(Ray r,float limit,const Balls &balls,int stage,bo
 
 #if !defined(__CUDACC__) && !defined(__CUDA__)
 constexpr float shadow_column_margin=.001f;
-// The area emitter is intersected separately from the room BVH.
-constexpr bool shadow_column_clear=
-    clear_slate_column(point_light_position.y+shadow_column_margin) &&
-    light_z+light_hz+shadow_column_margin< -table_clear_z;
+constexpr bool shadow_column_clear=clear_slate_column(point_light_position.y+shadow_column_margin);
 #endif
 
 ACG_HD inline float visibility_to_light(Vec origin,Vec source,const Balls &balls,int stage) {
@@ -1294,13 +1281,19 @@ ACG_HD inline float visibility_to_light(Vec origin,Vec source,const Balls &balls
     const float distance=sqrtf(dot(delta,delta));
     const Ray ray={origin,delta*(1/distance)};
     const float limit=distance-3*eps;
+    // When the opaque fixture is between a receiver and the room fill,
+    // it settles visibility without traversing the ball or room BVH.
+    if(stage==2 && source.y>light_y && origin.y<light_y &&
+       emitter_hit(ray,recip(ray.d.y),eps,limit)<limit) return 0;
     bool skip_static=false;
 #if !defined(__CUDACC__) && !defined(__CUDA__)
     if constexpr(shadow_column_clear) {
         // Both ends lie inside the clear column. The inset covers rounding in
         // the normalized direction and slab comparisons.
         constexpr float x=table_clear_x-shadow_column_margin,z=table_clear_z-shadow_column_margin;
-        skip_static=fabsf(source.z)<z && fabsf(origin.z)<z &&
+        // A segment ending exactly in the emitter plane uses normal traversal.
+        // The other upward segments either cannot reach it or were tested above.
+        skip_static=(stage!=2 || source.y!=light_y) && fabsf(source.z)<z && fabsf(origin.z)<z &&
             fabsf(source.x)<x && fabsf(origin.x)<x &&
             origin.y>0 && source.y>origin.y && source.y<=point_light_position.y && limit>=eps;
     }
@@ -1360,16 +1353,32 @@ bool analytic_area_sample(Vec p,Vec n,Vec wo,Vec q,Material m,const BrdfView& vi
     result=emission()*sum*(2*light_hz/area_samples);
     return true;
 }
+struct FirstLight {
+    uint32_t sample=~0u,key=0;
+};
+
+ACG_HD inline Vec first_light_r2(FirstLight first) {
+    // Shift the R2 sequence independently per pixel in integer coordinates.
+    // Unlike s/spp strata, prefixes remain nested when the budget changes.
+    const uint32_t u=hash32(first.key^0xa4aba1c3u)+0xc13fa9a9u*first.sample;
+    const uint32_t v=hash32(first.key^0x392fe91bu)+0x91e10da5u*first.sample;
+    return {float(u>>8)*0x1p-24f,0,float(v>>8)*0x1p-24f};
+}
+
 template<FeltPass Pass=FeltPass::Full>
 ACG_HD inline Vec lighting(Vec p,Vec n,Vec wo,Material m,const BrdfView& view,const Balls &balls,int stage,
-                           Rng &rng,const Hit& hit,bool analytic,float cached,bool compete) {
-    Vec I=stage==2?Vec{1.8f,1.63f,1.52f}:Vec{8.05f,7.35f,6.37f};
+                           Rng &rng,const Hit& hit,bool analytic,float cached,bool compete,FirstLight first={}) {
+    // Stage 2 uses a large key over the table and a weak fill. Stage 0/1
+    // retain the unmodified point-light diagnostic.
+    Vec I=stage==2?Vec{.36f,.326f,.304f}:Vec{8.05f,7.35f,6.37f};
     const Vec origin=p+n*eps;
     Vec out{};
     if constexpr (Pass!=FeltPass::Basis)
         out=direct_sample(p,n,wo,origin,point_light_position,I,false,m,view,balls,stage,cached,false);
     if(stage==2 && p.y<light_y) {
         const bool eligible=Pass==FeltPass::Full && analytic && soft_eligible(stage,hit,p,n,balls.c);
+        const bool r2=first.sample!=~0u;
+        const Vec stratum=r2?first_light_r2(first):Vec{};
 #ifdef ACG_STRATIFY_LIGHT_2D
         // Randomly pair the X and Z strata; a fixed diagonal would leave half
         // of the emitter unsampled. The marginal light PDF is unchanged.
@@ -1377,11 +1386,17 @@ ACG_HD inline Vec lighting(Vec p,Vec n,Vec wo,Material m,const BrdfView& view,co
         const int flip=int(hash32(rng.s ^ 0x640f32d1u)>>31);
 #endif
         for(int i=0;i<area_samples;++i) {
-            float u=(i+rng.next())/area_samples,v=rng.next();
+            float jx=rng.next(),v=rng.next();
+            if(r2) {
+                const float shift=float(i)/area_samples;
+                jx=eligible?fract(stratum.x+shift):stratum.x;
+                v=fract(stratum.z+shift);
+            }
 #ifdef ACG_STRATIFY_LIGHT_2D
-            if(!eligible) v=((i^flip)+v)*.5f;
+            if(!eligible && !r2) v=((i^flip)+v)*.5f;
 #endif
-            Vec q={(2*(eligible?u*area_samples-i:u)-1)*light_hx,light_y,light_z+(2*v-1)*light_hz};
+            const float u=eligible?jx:(i+jx)/area_samples;
+            Vec q={(2*u-1)*light_hx,light_y,light_z+(2*v-1)*light_hz};
             Vec contribution;
             if(eligible && analytic_area_sample(p,n,wo,q,m,view,balls,contribution,compete)) {
                 out=out+contribution;
@@ -1405,7 +1420,8 @@ ACG_HD inline bool glass_bounce(Vec d,Vec n,bool entering,Rng &rng,Vec &dir,floa
 }
 template<FeltPass Pass>
 ACG_HD inline Vec trace_felt_pass(Ray ray,const Balls &balls,int stage,float t,Rng &rng,
-                                  bool analytic=false,float cached=-1,Vec irradiance={},float pixel_width=0) {
+                                  bool analytic=false,float cached=-1,Vec irradiance={},float pixel_width=0,
+                                  FirstLight first={}) {
     Vec out={},beta=grey(1),prev={}; float prev_pdf=0,eta_scale=1; bool delta=true,inside=false;
 #ifndef ACG_MAX_HITS
 #define ACG_MAX_HITS 14
@@ -1453,9 +1469,10 @@ ACG_HD inline Vec trace_felt_pass(Ray ray,const Balls &balls,int stage,float t,R
             const bool continue_path=stage!=0 && depth+1<max_hits;
             const BrdfView view=prepare_brdf_view(m,n,wo);
             if(felt)
-                out=out+lighting<Pass>(p,n,wo,m,view,balls,stage,rng,hit,false,-1.f,continue_path);
+                out=out+lighting<Pass>(p,n,wo,m,view,balls,stage,rng,hit,false,-1.f,continue_path,first);
             else
-                out=out+beta*lighting(p,n,wo,m,view,balls,stage,rng,hit,analytic,vis,continue_path);
+                out=out+beta*lighting(p,n,wo,m,view,balls,stage,rng,hit,analytic,vis,continue_path,
+                                      depth==0?first:FirstLight{});
             if constexpr (Pass==FeltPass::Residual)
                 if(felt) out=out+irradiance*felt_diffuse_basis(m);
             if(!continue_path) break;
@@ -1475,8 +1492,8 @@ ACG_HD inline Vec trace_felt_pass(Ray ray,const Balls &balls,int stage,float t,R
     return out;
 }
 ACG_HD inline Vec trace(Ray ray,const Balls &balls,int stage,float t,Rng &rng,bool analytic=false,float cached=-1,
-                       float pixel_width=0) {
-    return trace_felt_pass<FeltPass::Full>(ray,balls,stage,t,rng,analytic,cached,{},pixel_width);
+                       float pixel_width=0,FirstLight first={}) {
+    return trace_felt_pass<FeltPass::Full>(ray,balls,stage,t,rng,analytic,cached,{},pixel_width,first);
 }
 ACG_HD inline float camera_pixel_width(int w,int h) {
     return 2*hi(.77f,1.40f/(float(w)/h))/h;

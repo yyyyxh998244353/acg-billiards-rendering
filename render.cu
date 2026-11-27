@@ -60,6 +60,24 @@ RENDER_HD inline RowSeed row_seed(int y,u32 sample_seed) {
     return {mix_bits(sample_seed ^ row), acg_scene_detail::hash32(row + 0x243f6a88u)};
 }
 
+struct Sampling {
+    int local_spp=0;
+    bool random_light=false;
+};
+constexpr float ball_detail_radius=.080f;
+
+RENDER_HD inline bool near_ball_pixel(int x,int y,int w,int h,float pitch,const Balls& balls) {
+    using namespace acg_scene_detail;
+    const float dx=(x+.5f-w*.5f)*pitch,dz=(y+.5f-h*.5f)*pitch;
+    if(dx<balls.box.a.x-ball_detail_radius || dx>balls.box.b.x+ball_detail_radius ||
+       dz<balls.box.a.z-ball_detail_radius || dz>balls.box.b.z+ball_detail_radius) return false;
+    for(Vec c:balls.c) {
+        const float px=dx-c.x,pz=dz-c.z;
+        if(px*px+pz*pz<ball_detail_radius*ball_detail_radius) return true;
+    }
+    return false;
+}
+
 RENDER_HD inline float display_code(float t) {
     const float s = t <= 0.0031308f ? 12.92f * t : 1.055f * powf(t, 1.0f / 2.4f) - 0.055f;
     return 255.0f * s + 0.5f;
@@ -119,7 +137,8 @@ RENDER_HD inline unsigned char display_byte(float linear) {
     return display_reference(linear);
 }
 
-RENDER_HD inline RGB8 render_pixel(int x,int y,int w,int h,int stage,int spp,const Balls* balls,unsigned poses,RowSeed row,float cached) {
+RENDER_HD inline RGB8 render_pixel(int x,int y,int w,int h,int stage,int spp,const Balls* balls,unsigned poses,
+                                  RowSeed row,float cached,Sampling sampling) {
     // No dependency on launch order, stage, spp budget or time. Matching pixels
     // share the same prefix of random samples in all comparison renders.
     using namespace acg_scene_detail;
@@ -127,13 +146,16 @@ RENDER_HD inline RGB8 render_pixel(int x,int y,int w,int h,int stage,int spp,con
     const u32 first = mix_bits(row.sample_key ^ column);
     const u32 path_key = row.path_key ^ hash32(column + 0x9e3779b9u);
     const float footprint=camera_pixel_width(w,h);
+    if(sampling.local_spp && near_ball_pixel(x,y,w,h,footprint,*balls)) spp=sampling.local_spp;
+    const u32 light_key=mix_bits(first^0x9e764389u);
     float r = 0, g = 0, b = 0;
     for (int s = 0; s < spp; ++s) {
         const u32 seed = mix_bits(first + static_cast<u32>(s));
         const unsigned pose = (static_cast<std::uint64_t>(mix_bits(seed ^ 0xba7c19u)) * poses) >> 32;
         Rng rng={hash32((seed?seed:base_seed)^path_key)};
         const Ray ray=camera(x,y,w,h,stage,rng);
-        const Vec v=trace(ray,balls[pose],stage,0.f,rng,analytic_shadow,cached,footprint);
+        const FirstLight light={sampling.random_light?~0u:static_cast<u32>(s),light_key};
+        const Vec v=trace(ray,balls[pose],stage,0.f,rng,analytic_shadow,cached,footprint,light);
         r += v.x; g += v.y; b += v.z;
     }
     const float inv = 1.0f / spp;
@@ -142,8 +164,10 @@ RENDER_HD inline RGB8 render_pixel(int x,int y,int w,int h,int stage,int spp,con
 
 #ifdef __CUDACC__
 using acg_felt::Grid;
+static_assert(ball_detail_radius < acg_felt::contact_pad, "The local sampler needs the full path outside the felt cache.");
 
-__global__ void sample_felt_anchors(Vec* values,int nx,int ny,int w,int h,int spp,u32 seed,const Balls* balls) {
+__global__ void sample_felt_anchors(Vec* values,int nx,int ny,int w,int h,int spp,u32 seed,const Balls* balls,
+                                    bool random_light) {
     using namespace acg_scene_detail;
     const int i=blockIdx.x*blockDim.x+threadIdx.x;
     if(i>=nx*ny) return;
@@ -157,7 +181,8 @@ __global__ void sample_felt_anchors(Vec* values,int nx,int ny,int w,int h,int sp
     Vec sum{};
     for(int s=0;s<spp;++s) {
         Rng rng={mix_bits(key+static_cast<u32>(s))};
-        sum=sum+trace_felt_pass<FeltPass::Basis>(ray,*balls,2,0.f,rng);
+        const FirstLight light={random_light?~0u:static_cast<u32>(s),mix_bits(key^0x9e764389u)};
+        sum=sum+trace_felt_pass<FeltPass::Basis>(ray,*balls,2,0.f,rng,false,-1.f,{},0.f,light);
     }
     const Vec v=sum*(1.f/spp);
     values[i]=(v.x>=0 && isfinite(v.x) && isfinite(v.y) && isfinite(v.z))?v:acg_felt::invalid;
@@ -174,17 +199,19 @@ __global__ void blend_felt(Vec* values,int nx,int ny,Grid coarse) {
 }
 
 __device__ inline RGB8 render_felt_pixel(int x,int y,int w,int h,int spp,const Balls& balls,
-                                        RowSeed row,Vec irradiance) {
+                                        RowSeed row,Vec irradiance,bool random_light) {
     using namespace acg_scene_detail;
     const auto column=static_cast<u32>(x);
     const u32 first=mix_bits(row.sample_key^column);
     const u32 path_key=row.path_key^hash32(column+0x9e3779b9u);
+    const u32 light_key=mix_bits(first^0x9e764389u);
     Vec sum{};
     for(int s=0;s<spp;++s) {
         const u32 seed=mix_bits(first+static_cast<u32>(s));
         Rng rng={hash32((seed?seed:base_seed)^path_key)};
         const Ray ray=camera(x,y,w,h,2,rng);
-        sum=sum+trace_felt_pass<FeltPass::Residual>(ray,balls,2,0.f,rng,false,-1.f,irradiance);
+        const FirstLight light={random_light?~0u:static_cast<u32>(s),light_key};
+        sum=sum+trace_felt_pass<FeltPass::Residual>(ray,balls,2,0.f,rng,false,-1.f,irradiance,0.f,light);
     }
     const float inv=1.f/spp;
     return {display_byte(sum.x*inv),display_byte(sum.y*inv),display_byte(sum.z*inv)};
@@ -194,7 +221,7 @@ enum class PixelPass { Full, Felt, Fallback };
 
 template<bool SharedPose,PixelPass Pass=PixelPass::Full>
 __global__ void render_pixels(RGB8* pixels,size_t count,int w,int h,int stage,int spp,const Balls* device_balls,
-                              unsigned poses,u32 sample_seed,const float* cache,Grid felt={}) {
+                              unsigned poses,u32 sample_seed,const float* cache,Sampling sampling,Grid felt={}) {
     if constexpr (SharedPose) {
         __shared__ BallBVH block_tree;
         alignas(Balls) __shared__ unsigned char pose_storage[sizeof(Balls)];
@@ -218,11 +245,11 @@ __global__ void render_pixels(RGB8* pixels,size_t count,int w,int h,int stage,in
         const RowSeed row=row_seed(y,sample_seed);
         if constexpr (Pass==PixelPass::Felt) {
             const Vec irradiance=acg_felt::bilinear(felt,x,y,acg_felt::pitch);
-            if(irradiance.x>=0) pixels[i]=render_felt_pixel(x,y,w,h,spp,*device_balls,row,irradiance);
+            if(irradiance.x>=0) pixels[i]=render_felt_pixel(x,y,w,h,spp,*device_balls,row,irradiance,sampling.random_light);
         } else {
             if constexpr (Pass==PixelPass::Fallback)
                 if(acg_felt::valid_cell(felt,x,y,acg_felt::pitch)) continue;
-            pixels[i]=render_pixel(x,y,w,h,stage,spp,device_balls,poses,row,cache?cache[i]:-1.f);
+            pixels[i]=render_pixel(x,y,w,h,stage,spp,device_balls,poses,row,cache?cache[i]:-1.f,sampling);
         }
     }
 }
@@ -312,6 +339,11 @@ int main(int argc, char** argv) try {
     const auto frames=sequence_mode?sequence::read_manifest(argv[7]):std::vector<sequence::Frame>{};
     float balls[64 * 32];
     const unsigned poses=sequence_mode?1:argc-7;
+    Sampling sampling;
+    if(const char* s=std::getenv("ACG_LOCAL_SPP")) sampling.local_spp=integer(s,spp,imax,"ball-neighborhood spp");
+    if(const char* s=std::getenv("ACG_RANDOM_LIGHT")) sampling.random_light=integer(s,0,1,"random first light")!=0;
+    if(sampling.local_spp && (stage!=2 || poses!=1))
+        throw std::runtime_error("The ball-neighborhood sampler requires single-pose stage 2");
     const char* felt_setting=std::getenv("ACG_FELT_CACHE");
     const char* felt_local=std::getenv("ACG_FELT_LOCAL_SPP");
     if(felt_local && !felt_setting) throw std::runtime_error("ACG_FELT_LOCAL_SPP requires ACG_FELT_CACHE");
@@ -437,7 +469,7 @@ int main(int argc, char** argv) try {
     if(anchor_spp) {
         const Grid fine_grid={fine,nx,ny},coarse_grid={coarse,cx,cy};
         const unsigned fine_blocks=(nx*ny+threads-1)/threads;
-        sample_felt_anchors<<<fine_blocks,threads>>>(fine,nx,ny,w,h,anchor_spp,sample_seed,device_balls);
+        sample_felt_anchors<<<fine_blocks,threads>>>(fine,nx,ny,w,h,anchor_spp,sample_seed,device_balls,sampling.random_light);
         CUDA_CHECK(cudaGetLastError());
         coarsen_felt<<<(cx*cy+threads-1)/threads,threads>>>(coarse,cx,cy,fine_grid);
         CUDA_CHECK(cudaGetLastError());
@@ -447,18 +479,18 @@ int main(int argc, char** argv) try {
         // Separate the two paths so their shaders don't spill into a single
         // oversized kernel. Every pixel belongs to exactly one dispatch.
         if(use_tree) {
-            render_pixels<true,PixelPass::Felt><<<blocks,threads>>>(device,count,w,h,stage,felt_spp,device_balls,poses,sample_seed,nullptr,fine_grid);
+            render_pixels<true,PixelPass::Felt><<<blocks,threads>>>(device,count,w,h,stage,felt_spp,device_balls,poses,sample_seed,nullptr,sampling,fine_grid);
             CUDA_CHECK(cudaGetLastError());
-            render_pixels<true,PixelPass::Fallback><<<blocks,threads>>>(device,count,w,h,stage,spp,device_balls,poses,sample_seed,nullptr,fine_grid);
+            render_pixels<true,PixelPass::Fallback><<<blocks,threads>>>(device,count,w,h,stage,spp,device_balls,poses,sample_seed,nullptr,sampling,fine_grid);
         } else {
-            render_pixels<false,PixelPass::Felt><<<blocks,threads>>>(device,count,w,h,stage,felt_spp,device_balls,poses,sample_seed,nullptr,fine_grid);
+            render_pixels<false,PixelPass::Felt><<<blocks,threads>>>(device,count,w,h,stage,felt_spp,device_balls,poses,sample_seed,nullptr,sampling,fine_grid);
             CUDA_CHECK(cudaGetLastError());
-            render_pixels<false,PixelPass::Fallback><<<blocks,threads>>>(device,count,w,h,stage,spp,device_balls,poses,sample_seed,nullptr,fine_grid);
+            render_pixels<false,PixelPass::Fallback><<<blocks,threads>>>(device,count,w,h,stage,spp,device_balls,poses,sample_seed,nullptr,sampling,fine_grid);
         }
     } else if (poses == 1 && use_tree)
-        render_pixels<true><<<blocks, threads>>>(device,count,w,h,stage,spp,device_balls,poses,sample_seed,device_cache);
+        render_pixels<true><<<blocks, threads>>>(device,count,w,h,stage,spp,device_balls,poses,sample_seed,device_cache,sampling);
     else
-        render_pixels<false><<<blocks, threads>>>(device,count,w,h,stage,spp,device_balls,poses,sample_seed,device_cache);
+        render_pixels<false><<<blocks, threads>>>(device,count,w,h,stage,spp,device_balls,poses,sample_seed,device_cache,sampling);
     CUDA_CHECK(cudaGetLastError());
     CUDA_CHECK(cudaEventRecord(end));
     CUDA_CHECK(cudaEventSynchronize(end));
@@ -491,7 +523,7 @@ int main(int argc, char** argv) try {
         const float* const shadows = shadow_cache?shadow_cache + offset:nullptr;
         const RowSeed seed = row_seed(y,sample_seed);
         for (int x = 0; x < w; ++x)
-            row[x] = render_pixel(x,y,w,h,stage,spp,prepared,poses,seed,shadows?shadows[x]:-1.f);
+            row[x] = render_pixel(x,y,w,h,stage,spp,prepared,poses,seed,shadows?shadows[x]:-1.f,sampling);
     }
     const double render_ms = elapsed_ms(render_start), d2h_ms = 0.0;
 #ifdef ACG_COUNT_TRAVERSAL

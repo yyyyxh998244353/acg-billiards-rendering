@@ -9,23 +9,44 @@ int main() {
     constexpr int samples=20000;
     const Vec p={0,0,0};
     {
-        // At a subpixel digit edge, coverage must match the average of the
-        // original bitmap, while the unfiltered digit toggles from 0 to 1.
-        constexpr float u=.91f,v=.91f,du=.1875f,dv=.21875f;
-        int ink=0;
-        constexpr int side=128;
-        for(int y=0;y<side;++y) for(int x=0;x<side;++x)
-            ink+=digit(7,u+(2*(x+.5f)/side-1)*du,v+(2*(y+.5f)/side-1)*dv);
-        const float coverage=digit_area(7,u,v,du,dv);
-        if(fabsf(coverage-float(ink)/(side*side))>.009f || !(coverage>0 && coverage<1)) {
-            std::fputs("Filtered glyph lost its subpixel ink coverage.\n",stderr);
+        double sharp=0,filtered=0;
+        for(int i=0;i<1024;++i) {
+            const float phase=(i+.5f)*pi/1024;
+            sharp+=marble_vein(phase,0);
+            filtered+=marble_vein(phase,.10f);
+        }
+        if(fabs(sharp-filtered)/1024>1.e-5 ||
+           fabsf(grain({0,0,.33f},.15f)-.53f)>1.e-6f) {
+            std::fputs("Texture filtering failed to preserve the unresolved phase mean.\n",stderr);
             return 1;
         }
-        const Vec n={sinf(.432f),0,cosf(.432f)},body={.28f,.05f,.03f};
-        const Vec rim=enamel(3,n,body),filtered=enamel(3,n,body,.035f);
-        if(!(filtered.x>rim.x+.03f && filtered.x<.60f) ||
-           fabsf(grain({0,0,.33f},.15f)-.53f)>1.e-6f) {
-            std::fputs("Filtered badges or wood grain retained an unresolved hard pattern.\n",stderr);
+    }
+    {
+        // First-hit sequence and interval quadrature must agree with
+        // ordinary ray visibility in a genuinely partial ball shadow.
+        Balls balls{};
+        float positions[32];
+        for(auto& value:positions) value=3;
+        positions[0]=positions[1]=0;
+        place_balls(balls,0,positions);
+        const Vec receiver={0,0,.036f},n={0,1,0};
+        const Hit hit={1,n,Felt,-1};
+        const Material m=varnish({.04f,.25f,.15f},.82f);
+        if(!soft_eligible(2,hit,receiver,n,balls.c)) {
+            std::fputs("The near-ball fixture cannot use interval integration.\n",stderr);
+            return 1;
+        }
+        const auto view=prepare_brdf_view(m,n,n);
+        Vec ray_sum{},interval_sum{},iid_sum{};
+        constexpr unsigned count=8192;
+        for(unsigned i=0;i<count;++i) {
+            Rng a={hash32(i+3127819u)},b=a,c=a;
+            ray_sum=ray_sum+lighting(receiver,n,n,m,view,balls,2,a,hit,false,-1.f,false,{i,584013u});
+            interval_sum=interval_sum+lighting(receiver,n,n,m,view,balls,2,b,hit,true,-1.f,false,{i,584013u});
+            iid_sum=iid_sum+lighting(receiver,n,n,m,view,balls,2,c,hit,false,-1.f,false);
+        }
+        if(fabsf(ray_sum.y-interval_sum.y)>count*.0025f || fabsf(ray_sum.y-iid_sum.y)>count*.0035f) {
+            std::fputs("The first-hit sequence or interval estimator biased a ball penumbra.\n",stderr);
             return 1;
         }
     }
@@ -269,7 +290,8 @@ int main() {
             Hit catcher,trim;
             if(!from_above(x,z,catcher) || catcher.mat!=Ebony ||
                fabsf(catcher.t-(camera_height-pocket_floor_y))>2*eps ||
-               !from_above(x,z+side*trim_sample,trim) || trim.mat!=PocketTrim ||
+               !from_above(x,z+side*(trim_sample+(column?0.f:side_pocket_shear*pocket_top)),trim) ||
+               trim.mat!=PocketTrim ||
                fabsf(trim.t-(camera_height-pocket_top))>2*eps || trim.normal.y!=1.f) {
                 std::fputs("Pocket center or raised trim gave the wrong surface.\n",stderr);
                 return 1;
@@ -291,6 +313,16 @@ int main() {
            end_bevel.normal.y<.70f || end_bevel.normal.x<.70f) {
             std::fputs("Pocket lining, clear cloth, or timber bevel is incorrect.\n",stderr);
             return 1;
+        }
+
+        for(int side:{-1,1}) {
+            Hit shelf;
+            if(!from_above(0,side*(table_nose_z-.015f),shelf) || shelf.mat!=Felt ||
+               fabsf(shelf.t-camera_height)>2*eps ||
+               visibility_to_light({0,eps,side*.615f},{0,light_y,side*.780f},balls,2)!=1) {
+                std::fputs("The side pocket lip overhangs the felt or casts an inboard shadow.\n",stderr);
+                return 1;
+            }
         }
 
         for(int side:{-1,1}) for(int column:{-1,0,1}) {
@@ -345,7 +377,7 @@ int main() {
             }
         }
 
-        const Ray rising={{.052f,.046f,.625f},unit({0,.1f,1})};
+        const Ray rising={{.036f,.046f,.625f},unit({0,.1f,1})};
         const Vec inverse=invdir(rising.d);
         const float cut=(table_nose_z-rising.o.z)*inverse.z;
         Hit face;
@@ -411,9 +443,10 @@ int main() {
             double sum[3]={},squares[3]={};
             for(int i=0;i<n;++i) {
                 Rng a={hash32(i+32957u)},b=a,c=a;
-                const Vec f=trace(ray,balls,2,0,a);
-                const Vec basis=trace_felt_pass<FeltPass::Basis>(ray,balls,2,0,b);
-                const Vec rebuilt=trace_felt_pass<FeltPass::Residual>(ray,balls,2,0,c,false,-1.f,basis);
+                const FirstLight first={static_cast<uint32_t>(i),4928531u};
+                const Vec f=trace(ray,balls,2,0,a,false,-1.f,0.f,first);
+                const Vec basis=trace_felt_pass<FeltPass::Basis>(ray,balls,2,0,b,false,-1.f,{},0.f,first);
+                const Vec rebuilt=trace_felt_pass<FeltPass::Residual>(ray,balls,2,0,c,false,-1.f,basis,0.f,first);
                 const Vec error=rebuilt-f;
                 for(int j=0;j<3;++j) {
                     const double v=axis(error,j); sum[j]+=v; squares[j]+=v*v;
