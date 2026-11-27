@@ -231,6 +231,69 @@ int main() {
             return 1;
         }
     }
+    {
+        Balls balls{};
+        float positions[32];
+        for(auto& position:positions) position=3;
+        place_balls(balls,0,positions);
+
+        const Vec down={0,-1,0};
+        const auto from_above=[&](float x,float z,Hit& hit) {
+            return intersect(Ray{{x,camera_height,z},down},balls,2,eps,far_t,hit);
+        };
+        constexpr float trim_sample=(bore+collar_top_radius)*.5f;
+        for(int side:{-1,1}) for(int column:{-1,0,1}) {
+            const float x=column*pocket_x,z=side*pocket_z;
+            Hit catcher,trim;
+            if(!from_above(x,z,catcher) || catcher.mat!=Ebony ||
+               fabsf(catcher.t-(camera_height+.155f))>2*eps ||
+               !from_above(x,z+side*trim_sample,trim) || trim.mat!=PocketTrim ||
+               fabsf(trim.t-(camera_height-pocket_top))>2*eps || trim.normal.y!=1.f) {
+                std::fputs("Pocket center or raised trim gave the wrong surface.\n",stderr);
+                return 1;
+            }
+            if(column && (!from_above(x+column*.067f,z-side*.032f,trim) || trim.mat!=PocketTrim ||
+                          fabsf(trim.t-(camera_height-pocket_top))>2*eps || trim.normal.y!=1.f)) {
+                std::fputs("Corner trim is missing on the end-rail side.\n",stderr);
+                return 1;
+            }
+        }
+
+        Hit cloth,lining,long_bevel,end_bevel;
+        if(!from_above(0,pocket_z-trim_sample,cloth) || cloth.mat!=Felt ||
+           !from_above((bore+pocket_throat)*.5f,pocket_z,lining) ||
+           lining.mat!=Leather || lining.normal.x>=0 || lining.normal.y<=0 ||
+           !from_above(.4f,.739f+.044f,long_bevel) || long_bevel.mat!=Timber ||
+           long_bevel.normal.y<.70f || long_bevel.normal.z<.70f ||
+           !from_above(1.374f+.044f,0,end_bevel) || end_bevel.mat!=Timber ||
+           end_bevel.normal.y<.70f || end_bevel.normal.x<.70f) {
+            std::fputs("Pocket lining, clear cloth, or timber bevel is incorrect.\n",stderr);
+            return 1;
+        }
+
+        for(float offset:{-.001f,.001f}) {
+            Hit joint;
+            if(!from_above(rail_x,rail_z-rail_half_width+offset,joint) ||
+               joint.mat!=Timber || fabsf(joint.t-(camera_height-rail_top))>2*eps) {
+                std::fputs("Timber joint deck is not flush.\n",stderr);
+                return 1;
+            }
+        }
+
+        const Ray rising={{.075f,.051f,.625f},unit({0,.1f,1})};
+        const Vec inverse=invdir(rising.d);
+        const float cut=(table_nose_z-rising.o.z)*inverse.z;
+        Hit face;
+        if(!intersect_with_inverse(rising,inverse,balls,2,eps,cut+.001f,face) ||
+           face.mat!=PocketTrim || face.t!=cut || face.normal.z!=-1.f ||
+           visibility(rising,cut+.001f,balls,2)!=0 ||
+           intersect_with_inverse(rising,inverse,balls,2,eps,cut,face) ||
+           intersect_with_inverse(rising,inverse,balls,2,cut,cut+.001f,face)) {
+            std::fputs("Pocket cut face, shadow, or open ray interval is incorrect.\n",stderr);
+            return 1;
+        }
+    }
+    std::puts("Six pocket openings, raised trim, inner lining and timber bevels passed.");
     std::puts("Overhead slate endpoints and ball priority passed.");
     std::puts("Point shadow ball, slate, grille and emitter occlusion passed.");
     std::puts("72 quadrature slices, blockage, tangency, grazing BRDF and area-light weights passed.");

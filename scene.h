@@ -76,10 +76,11 @@ ACG_HD inline bool overlaps(Box b,Ray r,Vec inv,float t0,float t1) {
            lo(t1,lo(hi(l.x,h.x),lo(hi(l.y,h.y),hi(l.z,h.z))));
 }
 
-enum Surface { Felt, Timber, Brass, Ebony, Leather, Floor, Wall, Ceiling, Glass, Grille, Ball, Lamp };
-enum Shape { Block, BoredBlock, CushionX, CushionZ, Well, Globe, Screen };
+enum Surface { Felt, Timber, Brass, Ebony, Leather, Floor, Wall, Ceiling, Glass, Grille, Ball, Lamp,
+               CushionCloth, PocketTrim };
+enum Shape { Block, BoredBlock, CushionX, CushionZ, Well, Globe, Screen, RailX, RailZ };
 ACG_HD constexpr bool uses_box_span(Shape shape) {
-    return shape==Block || shape==BoredBlock || shape==CushionX || shape==CushionZ || shape==Well;
+    return shape!=Globe && shape!=Screen;
 }
 struct Prim { Box box; Shape shape; Surface mat; int side; };
 constexpr int static_scene_capacity=96;
@@ -134,9 +135,14 @@ struct StaticScene {
     }
 };
 constexpr float pocket_x=1.283f,pocket_z=.652f,bore=.069f;
-constexpr float pocket_top=.049f,pocket_throat=.056f,pocket_bevel=.025f;
+constexpr float pocket_mouth_y=.049f,pocket_throat=.056f,pocket_bevel=.025f;
 constexpr float pocket_slope=(bore-pocket_throat)/pocket_bevel;
-constexpr float table_clear_x=1.20f, table_clear_z=.57f;
+constexpr float pocket_seam=pocket_mouth_y-pocket_bevel;
+constexpr float pocket_top=.056f,collar_bottom=.043f,collar_radius=.087f,collar_top_radius=.082f;
+constexpr float collar_slope=(collar_top_radius-collar_radius)/(pocket_top-collar_bottom);
+constexpr float rail_top=.048f,rail_half_width=.048f,rail_x=1.374f,rail_z=.739f;
+constexpr float table_nose_x=1.270f,table_nose_z=.635f;
+constexpr float table_clear_x=1.20f,table_clear_z=.55f;
 template<int LeafSize=3>
 ACG_HD constexpr StaticScene make_room() {
     StaticScene s={};
@@ -149,18 +155,20 @@ ACG_HD constexpr StaticScene make_room() {
     // Flat slate, rails, cushions and six bored pockets.
     s.add({-1.35f,-.11f,-.716f},{1.35f,0,.716f},Felt,BoredBlock);
     for(int side=-1;side<=1;side+=2) {
-        float z=side*.739f,x=side*1.374f;
-        s.add({-1.422f,-.115f,z-.048f},{1.422f,.048f,z+.048f},Timber,BoredBlock);
-        s.add({x-.048f,-.115f,-.691f},{x+.048f,.048f,.691f},Timber,BoredBlock);
+        const float z=side*rail_z,x=side*rail_x;
+        constexpr float extent_x=rail_x+rail_half_width,extent_z=rail_z+rail_half_width;
+        s.add({-extent_x,-.115f,z-rail_half_width},{extent_x,rail_top,z+rail_half_width},Timber,RailX,side);
+        s.add({x-rail_half_width,-.115f,-extent_z},{x+rail_half_width,rail_top,extent_z},Timber,RailZ,side);
         float qz=side*.667f,qx=side*1.302f;
         for(int half=-1;half<=1;half+=2) {
             float cx=half*.638f;
-            s.add({cx-.581f,0,qz-.032f},{cx+.581f,.044f,qz+.032f},Felt,CushionX,side);
+            s.add({cx-.581f,0,qz-.032f},{cx+.581f,.044f,qz+.032f},CushionCloth,CushionX,side);
         }
-        s.add({qx-.032f,0,-.581f},{qx+.032f,.044f,.581f},Felt,CushionZ,side);
+        s.add({qx-.032f,0,-.581f},{qx+.032f,.044f,.581f},CushionCloth,CushionZ,side);
         for(int k=-1;k<=1;++k) {
             float cx=k*pocket_x,cz=side*pocket_z;
-            s.add({cx-bore,-.225f,cz-bore},{cx+bore,pocket_top,cz+bore},Leather,Well);
+            s.add({cx-collar_radius,-.155f,cz-collar_radius},
+                  {cx+collar_radius,pocket_top,cz+collar_radius},Leather,Well);
         }
     }
     // Keep the transmissive reference object out of the primary table image.
@@ -561,6 +569,9 @@ ACG_HD inline float pocket_distance2(Vec v) {
     float x=fabsf(v.x); x=x>pocket_x*.5f?x-pocket_x:x;
     float z=fabsf(v.z)-pocket_z; return x*x+z*z;
 }
+ACG_HD inline float pocket_opening(float y) {
+    return pocket_throat+pocket_slope*clamp(y-pocket_seam,0.f,pocket_bevel);
+}
 ACG_HD constexpr Vec basis_axis(int k,float s) {
     return k==0?Vec{s,0,0}:k==1?Vec{0,s,0}:Vec{0,0,s};
 }
@@ -627,17 +638,55 @@ ACG_HD inline void primitive(const Prim &p,Ray r,Vec inv,float t0,Hit &h) {
 #endif
     if(p.shape==Well) {
         const Vec c=(b.a+b.b)*.5f,v=r.o-c;
-        const float seam=pocket_top-pocket_bevel;
+        const float side=c.z>0?1.f:-1.f;
+        const bool corner=fabsf(c.x)>pocket_x*.5f;
+        const float end_side=c.x>0?1.f:-1.f;
+        const auto on_rail_side=[&](Vec point) {
+            return side*point.z>=table_nose_z || (corner && end_side*point.x>=table_nose_x);
+        };
+        const auto collar_outer=[](float y) { return collar_radius+collar_slope*(y-collar_bottom); };
+        // The raised trim ends at the cushion nose, outside the ball envelope.
+        for(int face=0;face<2;++face) {
+            const float y=face?pocket_top:collar_bottom;
+            const float t=(y-r.o.y)*inv.y;
+            if(t<=t0 || t>=h.t) continue;
+            if(!on_rail_side(r.o+r.d*t)) continue;
+            const Vec local=v+r.d*t;
+            const float r2=local.x*local.x+local.z*local.z;
+            const float inner=pocket_opening(y),outer=face?collar_top_radius:collar_radius;
+            if(r2>=inner*inner && r2<=outer*outer)
+                record(h,t,NeedNormal?Vec{0,face?1.f:-1.f,0}:Vec{},PocketTrim);
+        }
+        // Close the exposed sections where the round collar meets the nose planes.
+        for(int k=corner?0:2;k<=2;k+=2) {
+            if(fabsf(axis(r.d,k))<=1.e-12f) continue;
+            const float sign=k==0?end_side:side;
+            const float nose=k==0?table_nose_x:table_nose_z;
+            const float t=(sign*nose-axis(r.o,k))*axis(inv,k);
+            if(t<=t0 || t>=h.t) continue;
+            const Vec point=r.o+r.d*t;
+            if(point.y<collar_bottom || point.y>pocket_top) continue;
+            if(k==0 ? side*point.z>=table_nose_z : corner && end_side*point.x>table_nose_x) continue;
+            const Vec local=v+r.d*t;
+            const float r2=local.x*local.x+local.z*local.z;
+            const float inner=pocket_opening(point.y),outer=collar_outer(point.y);
+            if(r2>=inner*inner && r2<=outer*outer)
+                record(h,t,NeedNormal?basis_axis(k,-sign):Vec{},PocketTrim);
+        }
         const float bottom=(b.a.y-r.o.y)*inv.y;
         if(bottom>t0 && bottom<h.t) {
             Vec p=v+r.d*bottom;
             if(p.x*p.x+p.z*p.z<=pocket_throat*pocket_throat)
-                record(h,bottom,NeedNormal?Vec{0,1,0}:Vec{},Leather);
+                record(h,bottom,NeedNormal?Vec{0,1,0}:Vec{},Ebony);
         }
-        // Intersect a vertical throat and a flared entrance, both analytically.
-        for(int part=0;part<2;++part) {
-            float k=part?pocket_slope:0.f;
-            float r0=pocket_throat+k*(r.o.y-seam), rd=k*r.d.y;
+        // Two interior sections, a raised inner return, and an outer bevel.
+        for(int part=0;part<4;++part) {
+            const bool outer=part==3,raised=part>=2;
+            const float y0=outer?collar_bottom:(raised?pocket_mouth_y:(part?pocket_seam:b.a.y));
+            const float y1=raised?pocket_top:(part?pocket_mouth_y:pocket_seam);
+            const float k=outer?collar_slope:(part==1?pocket_slope:0.f);
+            const float section_radius=outer?collar_radius:(raised?bore:pocket_throat);
+            const float r0=section_radius+k*(r.o.y-y0),rd=k*r.d.y;
             float a=r.d.x*r.d.x+r.d.z*r.d.z-rd*rd;
             float beta=v.x*r.d.x+v.z*r.d.z-r0*rd;
             float cc=v.x*v.x+v.z*v.z-r0*r0;
@@ -650,9 +699,11 @@ ACG_HD inline void primitive(const Prim &p,Ray r,Vec inv,float t0,Hit &h) {
                 float t=linear?-cc/(2*beta):(j?cc/q:q/a);
                 if(t<=t0 || t>=h.t) continue;
                 Vec p=v+r.d*t; float y=r.o.y+r.d.y*t;
-                if(y>=(part?seam:b.a.y) && y<=(part?pocket_top:seam))
-                    record(h,t,NeedNormal?unit({-p.x,k*(pocket_throat+k*(y-seam)),-p.z}):Vec{},
-                           part?Ebony:Leather);
+                if(y>=y0 && y<=y1 && (!raised || on_rail_side(r.o+r.d*t))) {
+                    const Vec outside={p.x,-k*(section_radius+k*(y-y0)),p.z};
+                    record(h,t,NeedNormal?unit(outer?outside:-outside):Vec{},
+                           raised?PocketTrim:Leather);
+                }
             }
         }
         return;
@@ -660,35 +711,47 @@ ACG_HD inline void primitive(const Prim &p,Ray r,Vec inv,float t0,Hit &h) {
 #ifdef ACG_PACKED_ROOM
     Span s={crossings.entry,crossings.exit,{},{}};
 #endif
-    bool cushion=p.shape==CushionX || p.shape==CushionZ;
-    if(cushion) {
+    const bool cushion=p.shape==CushionX || p.shape==CushionZ;
+    const bool rail=p.shape==RailX || p.shape==RailZ;
+    if(cushion || rail) {
 #ifdef ACG_PACKED_ROOM
         if constexpr(NeedNormal) {
             s.na=box_face<false>(crossings.near,inv);
             s.nb=box_face<true>(crossings.far,inv);
         }
 #endif
-        Vec along=p.shape==CushionX?Vec{1,0,0}:Vec{0,0,1};
-        Vec out=p.shape==CushionX?Vec{0,0,float(p.side)}:Vec{float(p.side),0,0};
-        Vec anchor=(b.a+b.b)*.5f-out*.032f; anchor.y=.029f;
-        float length=.5f*dot(b.b-b.a,along);
-        if(!clip(s,r,-out+Vec{0,.83f,0},anchor,0) || !clip(s,r,-out+Vec{0,-.46f,0},anchor,0) ||
-           !clip(s,r,along-out*.58f,anchor,length-.025f) || !clip(s,r,-along-out*.58f,anchor,length-.025f)) return;
+        const bool along_x=p.shape==CushionX || p.shape==RailX;
+        const Vec along=along_x?Vec{1,0,0}:Vec{0,0,1};
+        const Vec out=along_x?Vec{0,0,float(p.side)}:Vec{float(p.side),0,0};
+        Vec anchor=(b.a+b.b)*.5f;
+        if(rail) {
+            anchor=along_x?Vec{0,rail_top,p.side*rail_z}:Vec{p.side*rail_x,rail_top,0};
+            const Vec up={0,1,0};
+            const float miter_end=along_x?rail_x:rail_z;
+            if(!clip(s,r,along-out,anchor,miter_end) || !clip(s,r,-along-out,anchor,miter_end) ||
+               !clip(s,r,out+up,anchor,rail_half_width-.009f) ||
+               !clip(s,r,-out+up,anchor,rail_half_width-.006f)) return;
+        } else {
+            anchor=anchor-out*.032f; anchor.y=.029f;
+            const float length=.5f*dot(b.b-b.a,along);
+            if(!clip(s,r,-out+Vec{0,.83f,0},anchor,0) || !clip(s,r,-out+Vec{0,-.46f,0},anchor,0) ||
+               !clip(s,r,along-out*.58f,anchor,length-.025f) || !clip(s,r,-along-out*.58f,anchor,length-.025f)) return;
+        }
     }
     for(int k=0;k<2;++k) {
         float t=k?s.b:s.a; if(t<=t0 || t>=h.t) continue;
-        if(p.shape==BoredBlock || cushion) {
+        if(p.shape==BoredBlock || cushion || rail) {
             const Vec p0=r.o+r.d*t;
-            const float opening=pocket_throat+pocket_slope*clamp(p0.y-(pocket_top-pocket_bevel),0.f,pocket_bevel);
+            const float opening=pocket_opening(p0.y);
             if(pocket_distance2(p0)<opening*opening) continue;
         }
 #ifdef ACG_PACKED_ROOM
-        const Vec n=NeedNormal?(cushion?unit(k?s.nb:s.na):
+        const Vec n=NeedNormal?((cushion||rail)?unit(k?s.nb:s.na):
             (k?box_face<true>(crossings.far,inv):box_face<false>(crossings.near,inv))):Vec{};
         record(h,t,n,p.mat);
         break;
 #else
-        Vec n=k?s.nb:s.na; record(h,t,NeedNormal?(cushion?unit(n):n):Vec{},p.mat); break;
+        Vec n=k?s.nb:s.na; record(h,t,NeedNormal?((cushion||rail)?unit(n):n):Vec{},p.mat); break;
 #endif
     }
 }
@@ -703,7 +766,7 @@ constexpr Vec point_light_position={-.73f,1.54f,-.46f};
 // The central column between y=0 and the given height contains just the slate.
 // Its Z margin from either pocket row exceeds the largest pocket opening.
 constexpr bool clear_slate_column(float height) {
-    if(!(table_clear_z+bore+eps<pocket_z)) return false;
+    if(!(table_clear_z+collar_radius+eps<pocket_z)) return false;
     bool have_slate=false;
     for(int i=0;i<host_room.size;++i) {
         const Prim& p=host_room.p[i];
@@ -886,6 +949,24 @@ ACG_HD inline float grain(Vec p) {
     float rings=sinf(96*p.z+59*p.y+bend);
     return clamp(.53f+.27f*rings+.12f*sinf(239*p.z+123*p.y+2.3f*bend)+.06f*sinf(611*p.z+2*bend),0,1);
 }
+
+ACG_HD inline float cloth_finish(float along,float across) {
+    // Use a visible weave scale at the replay camera's sampling density.
+    const float nap=sinf(39*along+17*across+.8f*sinf(12*across));
+    const float weave=sinf(875*along+22*across)*sinf(760*across);
+    return .955f+.018f*nap+.036f*weave;
+}
+
+ACG_HD inline float rail_grain(Vec p) {
+    // Longitudinal figure, narrow growth bands and finer vessel streaks.
+    const float bend=.005f*sinf(5*p.x+2*p.z)+.0015f*sinf(27*p.x+9*p.y);
+    const float cross=p.z+.4f*p.y+bend;
+    const float phase=274*cross+1.4f*sinf(109*cross+5*p.x);
+    const float latewood=.5f+.5f*sinf(phase);
+    const float figure=sinf(17*p.x+85*cross)*sinf(47*cross-4*p.x);
+    const float pores=sinf(572*cross+7*p.x)*sinf(84*p.x+66*cross);
+    return clamp(.60f-.30f*latewood*latewood+.095f*figure+.066f*pores,0,1);
+}
 // Original bitmap digits, three columns by five rows, top row in high bits.
 ACG_HD inline unsigned glyph(int n) {
     switch(n) {
@@ -942,6 +1023,7 @@ ACG_HD inline Material material(Hit h,Vec p,const Balls &balls,float t,int stage
         Vec c;
         switch(h.mat) {
             case Felt:c={.035f,.30f,.175f};break; case Ball:c=pigment(number_for(h.id));break;
+            case CushionCloth:c={.027f,.21f,.13f};break; case PocketTrim:c={.17f,.086f,.040f};break;
             case Brass:c={.55f,.33f,.109f};break; case Timber:c={.245f,.091f,.036f};break;
             case Floor:c={.17f,.136f,.106f};break; case Ceiling:case Wall:c=grey(.48f);break;
             default:c=grey(.035f);break;
@@ -977,24 +1059,53 @@ ACG_HD inline Material material(Hit h,Vec p,const Balls &balls,float t,int stage
             return varnish(enamel(num,n,base),rough);
         }
         case Felt: {
-            float weave=.965f+.023f*sinf(2480*p.x+61*p.z)*sinf(2175*p.z);
-            return {{.025f*weave,.256f*weave,.16f*weave},grey(.019f),.81f};
+            const float tone=cloth_finish(p.x,p.z);
+            return {Vec{.027f,.248f,.154f}*tone,grey(.019f),.82f+.10f*(tone-.955f)};
+        }
+        case CushionCloth: {
+            const bool end=fabsf(p.x)>1.25f && fabsf(p.z)<.59f;
+            const float along=end?p.z:p.x;
+            const float cross_rail=end?fabsf(p.x)-1.302f:fabsf(p.z)-.667f;
+            const float weave=cloth_finish(along,cross_rail+.30f*p.y);
+            const float binding=1-.20f*hi(0,1-fabsf(cross_rail-.024f)/.003f);
+            return {Vec{.024f,.209f,.128f}*(weave*binding),grey(.019f),.85f};
         }
         case Timber: {
-            bool end=fabsf(p.x)>1.32f && fabsf(p.z)<.69f;
-            Vec wood=end?Vec{p.z,p.y,p.x}:p;
-            Vec c=mix({.070f,.021f,.012f},{.332f,.13f,.048f},grain(wood));
-            if(h.normal.y>.95f && fabsf(p.y-.048f)<.001f) {
-                float a=end?p.z:p.x, b=end?fabsf(p.x)-1.376f:fabsf(p.z)-.742f;
-                float d=fabsf(fract(a/.3175f+.5f)-.5f)*.3175f;
-                if(d/.012f+fabsf(b)/.018f<1) c={.89f,.82f,.63f};
-                if(pocket_distance2(p)<.079f*.079f) c={.049f,.031f,.022f};
+            const float joint=(fabsf(p.x)-rail_x)-(fabsf(p.z)-rail_z);
+            const bool end=joint>0;
+            const Vec wood=end?Vec{p.z+.27f,p.y,p.x}:p;
+            Vec c=mix({.081f,.029f,.011f},{.276f,.122f,.044f},rail_grain(wood));
+            const float across=end?fabsf(p.x)-rail_x:fabsf(p.z)-rail_z;
+            // A narrow dark inlay follows the grain along the outer edge.
+            c=c*(1-.36f*hi(0,1-fabsf(across-.031f)/.0028f));
+            if(fabsf(p.x)>=rail_x-rail_half_width && fabsf(p.z)>=rail_z-rail_half_width)
+                c=c*(1-.28f*hi(0,1-fabsf(joint)/.0018f));
+            if(h.normal.y>.95f && fabsf(p.y-rail_top)<.001f) {
+                const float along=end?p.z:p.x,mark=across+.001f;
+                const float d=fabsf(fract(along/.3175f+.5f)-.5f)*.3175f;
+                const float diamond=d/.009f+fabsf(mark)/.012f;
+                if(diamond<1 && pocket_distance2(p)>collar_radius*collar_radius)
+                    c=mix(c,{.71f,.66f,.53f},clamp((1-diamond)*9,0,1));
             }
-            return varnish(c,.255f);
+            return varnish(c,.29f);
         }
         case Brass:case Grille:return {grey(0),{.83f,.592f,.283f},h.mat==Grille?.31f:.235f};
-        case Ebony:return varnish({.042f,.026f,.023f},.31f);
-        case Leather:return varnish({.022f,.015f,.012f},.73f);
+        case PocketTrim: {
+            const float r=sqrtf(pocket_distance2(p));
+            const float texture=.5f+.5f*sinf(620*r+183*p.y);
+            const float welt=hi(0,1-fabsf(r-.078f)/.0022f);
+            const Vec c=mix({.081f,.035f,.014f},{.166f,.085f,.036f},texture*.24f+welt*.46f);
+            return varnish(c,.39f);
+        }
+        case Ebony: {
+            const float weave=.84f+.16f*sinf(820*p.x)*sinf(730*p.z);
+            return varnish(Vec{.039f,.031f,.024f}*weave,.86f);
+        }
+        case Leather: {
+            const float pebble=.89f+.08f*sinf(1150*p.x+510*p.y)*sinf(1030*p.z-290*p.y);
+            const float seam=hi(0,1-fabsf(p.y-(pocket_seam-.009f))/.002f);
+            return varnish(Vec{.051f,.024f,.011f}*(pebble*(1-.38f*seam)),.69f);
+        }
         case Wall: {
             float z=fabsf(h.normal.x)>.5f?p.z:p.x;
             bool molding=fabsf(p.y-.12f)<.022f || (p.y<.12f && fract(z/.46f)<.048f);
