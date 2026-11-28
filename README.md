@@ -34,10 +34,15 @@ ACG_BVH=rebuild ACG_SAMPLE_SEED=6035729 \
   python3 preview_replay.py ./render_gpu outputs/break-1080p --phase render \
   --width 1920 --height 1080 --fps 30 --last-frame 179 --spp 48
 ffmpeg -framerate 30 -i outputs/break-1080p/frame-%04d.ppm \
-  -c:v libx264 -pix_fmt yuv420p outputs/break-1080p.mp4
+  -vf 'scale=in_range=full:out_range=tv:out_color_matrix=bt709:flags=bicubic+accurate_rnd+full_chroma_int' \
+  -c:v libx264 -preset medium -crf 12 -pix_fmt yuv420p \
+  -color_primaries bt709 -color_trc iec61966-2-1 -colorspace bt709 \
+  -movflags +faststart -an outputs/break-1080p.mp4
 ```
 
 集群上只需在 GPU 作业中运行 `--phase render`；编译、轨迹生成和编码不需要 GPU。脚本不会自行提交 Slurm 作业。`timings.csv` 分别记录场景准备、上传、渲染、回读和写盘时间。
+
+成片采用 CRF 12，便于保留球号、球面纹理和库边反光。已有 PPM 帧时可直接运行编码命令。
 
 如果想重现**分层降噪版**，用一个新输出目录，把上面的 `--spp 48` 改为 `--spp 96`，并在 `--phase render` 的命令前加 `ACG_FELT_CACHE=384 ACG_FELT_LOCAL_SPP=24`。它用高采样锚点重建台布的低频漫反射光照；球、球袋和半影仍走完整路径。该模式只支持 CUDA 单姿态 stage 2，不与其他阴影缓存叠加。
 
