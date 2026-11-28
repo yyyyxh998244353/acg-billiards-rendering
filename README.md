@@ -54,6 +54,8 @@ ffmpeg -framerate 30 -i outputs/break-1080p/frame-%04d.ppm \
 
 在同一配置加 `ACG_RAIL_SOBOL=1`，对库边、球袋及紧邻库边的台布也启用联合分层。库边仍使用 72 spp。
 
+复现 80/192 spp 画质版时，渲染阶段把 `--spp` 设为 `80`、`ACG_LOCAL_SPP` 设为 `192`，沿用上述台布缓存、桌外预算和 Sobol 选项。
+
 ## 代码从哪里读
 
 - [`physics.py`](physics.py)：可重复的开球模拟，输出各帧的球心坐标。
